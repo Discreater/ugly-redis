@@ -12,7 +12,9 @@ use clap::Parser;
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
+    #[arg(long)]
     dir: Option<PathBuf>,
+    #[arg(long)]
     dbfilename: Option<String>,
 }
 

@@ -1,9 +1,7 @@
 use bytes::Buf;
 use std::{io, time::Duration};
 use tokio_util::codec::{Decoder, Encoder};
-use tracing::{debug, error, warn};
-
-use crate::utils::MapNone;
+use tracing::{debug, error};
 
 const CRLF: &'static [u8] = b"\r\n";
 
@@ -245,6 +243,14 @@ impl Encoder<Message> for MessageFramer {
 
     fn encode(&mut self, item: Message, dst: &mut bytes::BytesMut) -> Result<(), Self::Error> {
         match item {
+            Message::Arrays(messages) => {
+                dst.extend_from_slice(b"*");
+                dst.extend_from_slice(messages.len().to_string().as_bytes());
+                dst.extend_from_slice(CRLF);
+                for message in messages {
+                    self.encode(message, dst)?;
+                }
+            }
             Message::BulkStrings(Some(data)) => {
                 dst.extend_from_slice(b"$");
                 dst.extend_from_slice(data.len().to_string().as_bytes());
