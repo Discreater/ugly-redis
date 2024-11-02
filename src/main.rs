@@ -1,17 +1,27 @@
-#![allow(unused_imports)]
-use std::net::TcpListener;
+use std::io;
+use tokio::{io::{AsyncReadExt, AsyncWriteExt}, net::{TcpListener, TcpStream}};
 
-fn main() {
-    let listener = TcpListener::bind("127.0.0.1:6379").unwrap();
+
+#[tokio::main]
+async fn main() -> io::Result<()> {
+    let listener = TcpListener::bind("127.0.0.1:6379").await.unwrap();
     
-    for stream in listener.incoming() {
-        match stream {
-            Ok(_stream) => {
-                println!("accepted new connection");
-            }
-            Err(e) => {
-                println!("error: {}", e);
-            }
+    
+    loop {
+        let (socket, _) = listener.accept().await?;
+        tokio::spawn(async move {
+            process_socket(socket).await.unwrap()
+        });
+    }
+}
+
+async fn process_socket(mut socket: TcpStream) -> io::Result<()> {
+    let mut buf = vec![0; 1024];
+    loop {
+        let n = socket.read(&mut buf).await?;
+        if n == 0 {
+            return Ok(());
         }
+        socket.write(b"+PONG\r\n").await?;
     }
 }
