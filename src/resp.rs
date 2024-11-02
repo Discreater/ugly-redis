@@ -17,33 +17,62 @@ pub enum Command {
         value: String,
         px: Option<Duration>,
     },
+    Config(ConfigComand),
     Get(String),
 }
 
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum ConfigComand {
+    GET(String),
+}
+
 impl Command {
-    pub fn from(messages: Vec<Message>) -> Option<Self> {
+    pub fn from(messages: Vec<Message>) -> Result<Self, std::io::Error> {
         let mut messages = messages.into_iter();
-        let message = messages.next()?;
+        let message = messages
+            .next()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "empty messages"))?;
         match message {
             Message::BulkStrings(Some(data)) => match data.to_uppercase().as_str() {
-                "PING" => Some(Command::Ping),
+                "PING" => Ok(Command::Ping),
                 "ECHO" => {
-                    let message = messages.next()?;
-                    let data = message.get_string().ok()?;
-                    Some(Command::Echo(data))
+                    let message = messages.next().ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::InvalidData, "missing ECHO data")
+                    })?;
+                    let data = message.get_string().map_err(|m| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("invalid message: {:?}", m),
+                        )
+                    })?;
+                    Ok(Command::Echo(data))
                 }
                 "SET" => {
                     let key = messages
                         .next()
-                        .and_then(|m| m.get_string().ok())
-                        .map_none(|| warn!("SET command missing key"))?;
-                    let value =
-                        messages
-                            .next()
-                            .and_then(|m| m.get_string().ok())
-                            .map_none(|| {
-                                warn!("SET command missing value");
-                            })?;
+                        .ok_or_else(|| {
+                            io::Error::new(io::ErrorKind::InvalidData, "missing SET key")
+                        })?
+                        .get_string()
+                        .map_err(|m| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                format!("invalid message: {:?}", m),
+                            )
+                        })?;
+                    let value = messages
+                        .next()
+                        .ok_or_else(|| {
+                            io::Error::new(io::ErrorKind::InvalidData, "missing SET value")
+                        })?
+                        .get_string()
+                        .map_err(|m| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                format!("invalid message: {:?}", m),
+                            )
+                        })?;
                     let mut px = None;
                     while let Some(message) = messages.next() {
                         match message.get_string() {
@@ -51,9 +80,18 @@ impl Command {
                                 "PX" => {
                                     let data = messages
                                         .next()
-                                        .and_then(|m| m.get_string().ok())
-                                        .map_none(|| {
-                                            warn!("Set command missing PX value");
+                                        .ok_or_else(|| {
+                                            io::Error::new(
+                                                io::ErrorKind::InvalidData,
+                                                "missing PX value",
+                                            )
+                                        })?
+                                        .get_string()
+                                        .map_err(|m| {
+                                            io::Error::new(
+                                                io::ErrorKind::InvalidData,
+                                                format!("invalid message: {:?}", m),
+                                            )
                                         })?;
                                     match data.parse::<u64>() {
                                         Ok(ms) => {
@@ -73,24 +111,70 @@ impl Command {
                             }
                         }
                     }
-                    Some(Command::Set { key, value, px })
+                    Ok(Command::Set { key, value, px })
                 }
                 "GET" => {
                     let key = messages
                         .next()
-                        .and_then(|m| m.get_string().ok())
-                        .map_none(|| warn!("Get command missing key"))?;
-                    Some(Command::Get(key))
+                        .ok_or_else(|| {
+                            io::Error::new(io::ErrorKind::InvalidData, "missing GET key")
+                        })?
+                        .get_string()
+                        .map_err(|m| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                format!("invalid message: {:?}", m),
+                            )
+                        })?;
+                    Ok(Command::Get(key))
                 }
-                _ => {
-                    error!("unsupported command: {}", data);
-                    None
+                "CONFIG" => {
+                    let sub_command = messages
+                        .next()
+                        .ok_or_else(|| {
+                            io::Error::new(io::ErrorKind::InvalidData, "missing CONFIG sub command")
+                        })?
+                        .get_string()
+                        .map_err(|m| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                format!("invalid message: {:?}", m),
+                            )
+                        })?;
+                    match sub_command.to_uppercase().as_str() {
+                        "GET" => {
+                            let key = messages
+                                .next()
+                                .ok_or_else(|| {
+                                    io::Error::new(
+                                        io::ErrorKind::InvalidData,
+                                        "missing CONFIG GET key",
+                                    )
+                                })?
+                                .get_string()
+                                .map_err(|m| {
+                                    io::Error::new(
+                                        io::ErrorKind::InvalidData,
+                                        format!("invalid message: {:?}", m),
+                                    )
+                                })?;
+                            Ok(Command::Config(ConfigComand::GET(key)))
+                        }
+                        _ => Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("unsupported CONFIG sub command: {}", sub_command),
+                        )),
+                    }
                 }
+                _ => Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("unsupported command: {}", data),
+                )),
             },
-            _ => {
-                error!("unsupported message type: {:?}", message);
-                return None;
-            }
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unsupported message: {:?}", message),
+            )),
         }
     }
 }
