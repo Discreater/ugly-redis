@@ -1,30 +1,44 @@
 mod resp;
+mod utils;
 
 use futures_util::{SinkExt, StreamExt};
 use resp::{Command, Commander, MessageFramer};
-use std::io;
-use tokio::net::{TcpListener, TcpStream};
+use std::{collections::HashMap, io, sync::Arc};
+use tokio::{
+    net::{TcpListener, TcpStream},
+    sync::RwLock,
+};
 use tracing::{error, info, trace, Level};
 
 use resp::Message;
 
 #[tokio::main]
 async fn main() -> io::Result<()> {
-    if let Ok(_) = std::env::var("REDIS_LOG") {
-        tracing_subscriber::fmt()
-            .with_max_level(Level::TRACE)
-            .init();
-    }
+    let log_level = if std::env::var("REDIS_LOG").is_ok() {
+        Level::TRACE
+    } else {
+        Level::WARN
+    };
+    tracing_subscriber::fmt().with_max_level(log_level).init();
 
     let listener = TcpListener::bind("127.0.0.1:6379").await.unwrap();
+    let db = Arc::new(RwLock::new(HashMap::new()));
 
     loop {
         let (socket, _) = listener.accept().await?;
-        tokio::spawn(async move { process_socket(socket).await.expect("process socket error") });
+        let db = db.clone();
+        tokio::spawn(async move {
+            process_socket(socket, db)
+                .await
+                .expect("process socket error")
+        });
     }
 }
 
-async fn process_socket(socket: TcpStream) -> io::Result<()> {
+async fn process_socket(
+    socket: TcpStream,
+    db: Arc<RwLock<HashMap<String, String>>>,
+) -> io::Result<()> {
     let mut socket = tokio_util::codec::Framed::new(socket, MessageFramer);
 
     loop {
@@ -49,6 +63,27 @@ async fn process_socket(socket: TcpStream) -> io::Result<()> {
                         Command::Echo(data) => {
                             info!("received command ECHO with data: {}", data);
                             socket.send(Message::BulkStrings(Some(data))).await?;
+                        }
+                        Command::Get(key) => {
+                            info!("received command GET with key: {}", key);
+                            let value = {
+                                let db = db.read().await;
+                                db.get(&key).cloned()
+                            };
+                            socket.send(Message::BulkStrings(value)).await?;
+                        }
+                        Command::Set { key, value } => {
+                            info!(
+                                "received command SET with key: {} and value: {}",
+                                key, value
+                            );
+                            {
+                                let mut db = db.write().await;
+                                db.insert(key, value);
+                            }
+                            socket
+                                .send(Message::SimpleStrings("OK".to_string()))
+                                .await?;
                         }
                     }
                 }

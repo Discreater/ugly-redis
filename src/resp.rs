@@ -1,13 +1,19 @@
 use bytes::Buf;
-use tracing::{debug, error};
 use std::io;
 use tokio_util::codec::{Decoder, Encoder};
+use tracing::{debug, error, warn};
+
+use crate::utils::MapNone;
 
 const CRLF: &'static [u8] = b"\r\n";
 
+#[derive(Debug)]
+#[non_exhaustive]
 pub enum Command {
     Ping,
     Echo(String),
+    Set { key: String, value: String },
+    Get(String),
 }
 
 pub struct Commander(std::vec::IntoIter<Message>);
@@ -24,19 +30,39 @@ impl<'a> Iterator for Commander {
     fn next(&mut self) -> Option<Self::Item> {
         let message = self.0.next()?;
         match message {
-            Message::BulkStrings(Some(data)) => match data.to_ascii_lowercase().as_str() {
-                "ping" => Some(Command::Ping),
-                "echo" => {
+            Message::BulkStrings(Some(data)) => match data.to_uppercase().as_str() {
+                "PING" => Some(Command::Ping),
+                "ECHO" => {
                     let message = self.0.next()?;
-                    match message {
-                        Message::BulkStrings(Some(data)) => Some(Command::Echo(data)),
-                        _ => None,
-                    }
+                    let data = message.get_string()?;
+                    Some(Command::Echo(data))
                 }
-                _ => None,
+                "SET" => {
+                    let key = self
+                        .0
+                        .next()
+                        .and_then(Message::get_string)
+                        .map_none(|| warn!("SET command missing key"))?;
+                    let value = self.0.next().and_then(Message::get_string).map_none(|| {
+                        warn!("SET command missing value");
+                    })?;
+                    Some(Command::Set { key, value })
+                }
+                "GET" => {
+                    let key = self
+                        .0
+                        .next()
+                        .and_then(Message::get_string)
+                        .map_none(|| warn!("Get command missing key"))?;
+                    Some(Command::Get(key))
+                }
+                _ => {
+                    error!("unsupported command: {}", data);
+                    None
+                }
             },
             _ => {
-                eprintln!("unsupported message type: {:?}", message);
+                error!("unsupported message type: {:?}", message);
                 return None;
             }
         }
@@ -77,6 +103,16 @@ pub enum Message {
     Pushes,
 }
 
+impl Message {
+    pub fn get_string(self) -> Option<String> {
+        Some(match self {
+            Message::BulkStrings(Some(data)) => data,
+            Message::SimpleStrings(data) => data,
+            _ => return None,
+        })
+    }
+}
+
 pub struct MessageFramer;
 
 impl Decoder for MessageFramer {
@@ -106,12 +142,19 @@ impl Encoder<Message> for MessageFramer {
                 dst.extend_from_slice(data.as_bytes());
                 dst.extend_from_slice(CRLF);
             }
+            Message::BulkStrings(None) => {
+                dst.extend_from_slice(b"$-1");
+                dst.extend_from_slice(CRLF);
+            }
             Message::SimpleStrings(data) => {
                 dst.extend_from_slice(b"+");
                 dst.extend_from_slice(data.as_bytes());
                 dst.extend_from_slice(CRLF);
             }
-            _ => unimplemented!(),
+            _ => {
+                error!("unsupported message: {:?}", item);
+                unimplemented!()
+            }
         }
         Ok(())
     }
