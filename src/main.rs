@@ -2,8 +2,8 @@ mod resp;
 mod utils;
 
 use futures_util::{SinkExt, StreamExt};
-use resp::{Command, Commander, MessageFramer};
-use std::{collections::HashMap, io, sync::Arc};
+use resp::{Command, MessageFramer};
+use std::{collections::HashMap, io, sync::Arc, time::Duration};
 use tokio::{
     net::{TcpListener, TcpStream},
     sync::RwLock,
@@ -35,9 +35,15 @@ async fn main() -> io::Result<()> {
     }
 }
 
+#[derive(Debug, Clone)]
+struct Entry {
+    value: String,
+    expired_time: Option<std::time::Instant>,
+}
+
 async fn process_socket(
     socket: TcpStream,
-    db: Arc<RwLock<HashMap<String, String>>>,
+    db: Arc<RwLock<HashMap<String, Entry>>>,
 ) -> io::Result<()> {
     let mut socket = tokio_util::codec::Framed::new(socket, MessageFramer);
 
@@ -52,39 +58,60 @@ async fn process_socket(
 
         match message {
             Message::Arrays(messages) => {
-                for command in Commander::new(messages) {
-                    match command {
-                        Command::Ping => {
-                            info!("received command PING");
-                            socket
-                                .send(Message::SimpleStrings("PONG".to_string()))
-                                .await?;
-                        }
-                        Command::Echo(data) => {
-                            info!("received command ECHO with data: {}", data);
-                            socket.send(Message::BulkStrings(Some(data))).await?;
-                        }
-                        Command::Get(key) => {
-                            info!("received command GET with key: {}", key);
-                            let value = {
-                                let db = db.read().await;
-                                db.get(&key).cloned()
-                            };
-                            socket.send(Message::BulkStrings(value)).await?;
-                        }
-                        Command::Set { key, value } => {
-                            info!(
-                                "received command SET with key: {} and value: {}",
-                                key, value
-                            );
-                            {
-                                let mut db = db.write().await;
-                                db.insert(key, value);
+                match Command::from(messages)
+                    .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid messages"))?
+                {
+                    Command::Ping => {
+                        info!("received command PING");
+                        socket
+                            .send(Message::SimpleStrings("PONG".to_string()))
+                            .await?;
+                    }
+                    Command::Echo(data) => {
+                        info!("received command ECHO with data: {}", data);
+                        socket.send(Message::BulkStrings(Some(data))).await?;
+                    }
+                    Command::Get(key) => {
+                        info!("received command GET with key: {}", key);
+                        let value = {
+                            let db = db.read().await;
+                            db.get(&key).cloned()
+                        };
+                        let value = if let Some(entry) = value {
+                            if let Some(expired_time) = entry.expired_time {
+                                if expired_time < std::time::Instant::now() {
+                                    None
+                                } else {
+                                    Some(entry.value)
+                                }
+                            } else {
+                                Some(entry.value)
                             }
-                            socket
-                                .send(Message::SimpleStrings("OK".to_string()))
-                                .await?;
+                        } else {
+                            None
+                        };
+                        socket.send(Message::BulkStrings(value)).await?;
+                    }
+                    Command::Set { key, value, px } => {
+                        info!(
+                            "received command SET with key: {} and value: {}, px: {:?}",
+                            key, value, px
+                        );
+                        let expired_time = px.map(|px| std::time::Instant::now() + px);
+                        {
+                            let mut db = db.write().await;
+
+                            db.insert(
+                                key,
+                                Entry {
+                                    value,
+                                    expired_time,
+                                },
+                            );
                         }
+                        socket
+                            .send(Message::SimpleStrings("OK".to_string()))
+                            .await?;
                     }
                 }
             }

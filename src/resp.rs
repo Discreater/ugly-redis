@@ -1,5 +1,5 @@
 use bytes::Buf;
-use std::io;
+use std::{io, time::Duration};
 use tokio_util::codec::{Decoder, Encoder};
 use tracing::{debug, error, warn};
 
@@ -12,47 +12,73 @@ const CRLF: &'static [u8] = b"\r\n";
 pub enum Command {
     Ping,
     Echo(String),
-    Set { key: String, value: String },
+    Set {
+        key: String,
+        value: String,
+        px: Option<Duration>,
+    },
     Get(String),
 }
 
-pub struct Commander(std::vec::IntoIter<Message>);
-
-impl Commander {
-    pub fn new(messages: Vec<Message>) -> Commander {
-        Commander(messages.into_iter())
-    }
-}
-
-impl<'a> Iterator for Commander {
-    type Item = Command;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        let message = self.0.next()?;
+impl Command {
+    pub fn from(messages: Vec<Message>) -> Option<Self> {
+        let mut messages = messages.into_iter();
+        let message = messages.next()?;
         match message {
             Message::BulkStrings(Some(data)) => match data.to_uppercase().as_str() {
                 "PING" => Some(Command::Ping),
                 "ECHO" => {
-                    let message = self.0.next()?;
-                    let data = message.get_string()?;
+                    let message = messages.next()?;
+                    let data = message.get_string().ok()?;
                     Some(Command::Echo(data))
                 }
                 "SET" => {
-                    let key = self
-                        .0
+                    let key = messages
                         .next()
-                        .and_then(Message::get_string)
+                        .and_then(|m| m.get_string().ok())
                         .map_none(|| warn!("SET command missing key"))?;
-                    let value = self.0.next().and_then(Message::get_string).map_none(|| {
-                        warn!("SET command missing value");
-                    })?;
-                    Some(Command::Set { key, value })
+                    let value =
+                        messages
+                            .next()
+                            .and_then(|m| m.get_string().ok())
+                            .map_none(|| {
+                                warn!("SET command missing value");
+                            })?;
+                    let mut px = None;
+                    while let Some(message) = messages.next() {
+                        match message.get_string() {
+                            Ok(option) => match option.to_uppercase().as_str() {
+                                "PX" => {
+                                    let data = messages
+                                        .next()
+                                        .and_then(|m| m.get_string().ok())
+                                        .map_none(|| {
+                                            warn!("Set command missing PX value");
+                                        })?;
+                                    match data.parse::<u64>() {
+                                        Ok(ms) => {
+                                            px = Some(Duration::from_millis(ms));
+                                        }
+                                        Err(_) => {
+                                            error!("Set command has invalid PX value: {}", data)
+                                        }
+                                    }
+                                }
+                                s => {
+                                    error!("Set command has invalid option: {}", s)
+                                }
+                            },
+                            Err(message) => {
+                                error!("SET command has invalid message: {:?}", message);
+                            }
+                        }
+                    }
+                    Some(Command::Set { key, value, px })
                 }
                 "GET" => {
-                    let key = self
-                        .0
+                    let key = messages
                         .next()
-                        .and_then(Message::get_string)
+                        .and_then(|m| m.get_string().ok())
                         .map_none(|| warn!("Get command missing key"))?;
                     Some(Command::Get(key))
                 }
@@ -104,11 +130,11 @@ pub enum Message {
 }
 
 impl Message {
-    pub fn get_string(self) -> Option<String> {
-        Some(match self {
+    pub fn get_string(self) -> Result<String, Self> {
+        Ok(match self {
             Message::BulkStrings(Some(data)) => data,
             Message::SimpleStrings(data) => data,
-            _ => return None,
+            _ => return Err(self),
         })
     }
 }
