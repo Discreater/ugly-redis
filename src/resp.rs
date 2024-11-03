@@ -1,7 +1,7 @@
 use bytes::Buf;
 use std::{io, time::Duration};
 use tokio_util::codec::{Decoder, Encoder};
-use tracing::{debug, error, trace};
+use tracing::{error, trace};
 
 const CRLF: &'static [u8] = b"\r\n";
 

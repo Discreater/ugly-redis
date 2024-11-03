@@ -6,6 +6,7 @@ use redis_starter_rust::{
 };
 use std::{
     io,
+    net::{Ipv4Addr, SocketAddrV4},
     sync::Arc,
     time::{Duration, UNIX_EPOCH},
 };
@@ -24,6 +25,8 @@ struct Args {
     dir: Option<String>,
     #[arg(long)]
     dbfilename: Option<String>,
+    #[arg(long, default_value = "6379")]
+    port: u16,
 }
 
 #[tokio::main]
@@ -37,7 +40,9 @@ async fn main() -> io::Result<()> {
     let args = Args::parse();
     let db = rdb::init(&args.dir, &args.dbfilename)?;
 
-    let listener = TcpListener::bind("127.0.0.1:6379").await.unwrap();
+    let listener = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), args.port))
+        .await
+        .unwrap();
     let db = Arc::new(RwLock::new(db));
     let config = Arc::new(args);
 
