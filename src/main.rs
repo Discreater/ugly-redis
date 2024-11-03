@@ -19,6 +19,8 @@ use tracing::{error, info, trace, Level};
 
 use clap::Parser;
 
+const REPLICATION_ID: &str = "8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb";
+
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
@@ -30,6 +32,12 @@ struct Args {
     port: u16,
     #[arg(long)]
     replicaof: Option<String>,
+}
+
+impl Args {
+    fn is_master(&self) -> bool {
+        self.replicaof.is_none()
+    }
 }
 
 #[tokio::main]
@@ -194,10 +202,12 @@ async fn process_socket(socket: TcpStream, db: Arc<RwLock<Db>>, cfg: Arc<Args>) 
 
 fn replication_info(cfg: &Args) -> HashMap<String, String> {
     let mut info = HashMap::new();
-    if cfg.replicaof.is_some() {
-        info.insert("role".to_string(), "slave".to_string());
-    } else {
+    if cfg.is_master() {
         info.insert("role".to_string(), "master".to_string());
+        info.insert("master_replid".to_string(), REPLICATION_ID.to_string());
+        info.insert("master_repl_offset".to_string(), "0".to_string());
+    } else {
+        info.insert("role".to_string(), "slave".to_string());
     }
     info
 }
