@@ -30,8 +30,19 @@ struct Args {
     dbfilename: Option<String>,
     #[arg(long, default_value = "6379")]
     port: u16,
-    #[arg(long)]
-    replicaof: Option<String>,
+    #[arg(long, value_parser = parse_socket_addr_v4)]
+    replicaof: Option<SocketAddrV4>,
+}
+
+fn parse_socket_addr_v4(s: &str) -> Result<SocketAddrV4, String> {
+    let (ip, port) = s.split_once(" ").ok_or("invalid socket address")?;
+    let ip = if ip == "localhost" {
+        Ipv4Addr::LOCALHOST
+    } else {
+        ip.parse().map_err(|_| "invalid ip address")?
+    };
+    let port = port.parse().map_err(|_| "invalid port")?;
+    Ok(SocketAddrV4::new(ip, port))
 }
 
 impl Args {
@@ -56,6 +67,16 @@ async fn main() -> io::Result<()> {
         .unwrap();
     let db = Arc::new(RwLock::new(db));
     let config = Arc::new(args);
+
+    if let Some(replicaof) = &config.replicaof {
+        let master = TcpStream::connect(replicaof).await?;
+        let mut master = tokio_util::codec::Framed::new(master, MessageFramer);
+        master
+            .send(Message::Arrays(vec![Message::SimpleStrings(
+                "PING".to_string(),
+            )]))
+            .await?;
+    }
 
     loop {
         let (socket, _) = listener.accept().await?;
