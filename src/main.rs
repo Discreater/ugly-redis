@@ -1,6 +1,14 @@
 use futures_util::{SinkExt, StreamExt};
-use redis_starter_rust::resp::{Command, ConfigComand, Message, MessageFramer};
-use std::{collections::HashMap, io, path::PathBuf, sync::Arc};
+use redis_starter_rust::{
+    db::Db,
+    rdb,
+    resp::{Command, ConfigComand, Message, MessageFramer},
+};
+use std::{
+    io,
+    sync::Arc,
+    time::{Duration, UNIX_EPOCH},
+};
 use tokio::{
     net::{TcpListener, TcpStream},
     sync::RwLock,
@@ -13,7 +21,7 @@ use clap::Parser;
 #[command(author, version, about, long_about = None)]
 struct Args {
     #[arg(long)]
-    dir: Option<PathBuf>,
+    dir: Option<String>,
     #[arg(long)]
     dbfilename: Option<String>,
 }
@@ -27,10 +35,11 @@ async fn main() -> io::Result<()> {
     };
     tracing_subscriber::fmt().with_max_level(log_level).init();
     let args = Args::parse();
-    let config = Arc::new(RwLock::new(args));
+    let db = rdb::init(&args.dir, &args.dbfilename)?;
 
     let listener = TcpListener::bind("127.0.0.1:6379").await.unwrap();
-    let db = Arc::new(RwLock::new(HashMap::new()));
+    let db = Arc::new(RwLock::new(db));
+    let config = Arc::new(args);
 
     loop {
         let (socket, _) = listener.accept().await?;
@@ -44,17 +53,7 @@ async fn main() -> io::Result<()> {
     }
 }
 
-#[derive(Debug, Clone)]
-struct Entry {
-    value: String,
-    expired_time: Option<std::time::Instant>,
-}
-
-async fn process_socket(
-    socket: TcpStream,
-    db: Arc<RwLock<HashMap<String, Entry>>>,
-    cfg: Arc<RwLock<Args>>,
-) -> io::Result<()> {
+async fn process_socket(socket: TcpStream, db: Arc<RwLock<Db>>, cfg: Arc<Args>) -> io::Result<()> {
     let mut socket = tokio_util::codec::Framed::new(socket, MessageFramer);
 
     loop {
@@ -80,19 +79,21 @@ async fn process_socket(
                 }
                 Command::Get(key) => {
                     info!("received command GET with key: {}", key);
-                    let value = {
+                    let (value, expire) = {
                         let db = db.read().await;
-                        db.get(&key).cloned()
+                        (db.kv.get(&key).cloned(), db.expire.get(&key).cloned())
                     };
-                    let value = if let Some(entry) = value {
-                        if let Some(expired_time) = entry.expired_time {
-                            if expired_time < std::time::Instant::now() {
+                    let value = if let Some(value) = value {
+                        if let Some(expire) = expire {
+                            if UNIX_EPOCH + Duration::from_millis(expire)
+                                < std::time::SystemTime::now()
+                            {
                                 None
                             } else {
-                                Some(entry.value)
+                                Some(value)
                             }
                         } else {
-                            Some(entry.value)
+                            Some(value)
                         }
                     } else {
                         None
@@ -104,17 +105,21 @@ async fn process_socket(
                         "received command SET with key: {} and value: {}, px: {:?}",
                         key, value, px
                     );
-                    let expired_time = px.map(|px| std::time::Instant::now() + px);
+                    let expired_time = px.and_then(|px| {
+                        (std::time::SystemTime::now() + px)
+                            .duration_since(UNIX_EPOCH)
+                            .ok()
+                            .map(|d| d.as_millis() as u64)
+                    });
                     {
                         let mut db = db.write().await;
+                        db.kv.insert(key.clone(), value);
 
-                        db.insert(
-                            key,
-                            Entry {
-                                value,
-                                expired_time,
-                            },
-                        );
+                        if let Some(expired_time) = expired_time {
+                            db.expire.insert(key.clone(), expired_time);
+                        } else {
+                            db.expire.remove_entry(&key);
+                        }
                     }
                     socket
                         .send(Message::SimpleStrings("OK".to_string()))
@@ -122,18 +127,27 @@ async fn process_socket(
                 }
                 Command::Config(ConfigComand::GET(key)) => {
                     info!("received command CONFIG GET with key: {}", key);
-                    let cfg = cfg.read().await;
                     let value = match key.as_str() {
-                        "dir" => cfg
-                            .dir
-                            .as_ref()
-                            .map(|dir: &PathBuf| dir.to_string_lossy().to_string()),
-                        "dbfilename" => cfg.dbfilename.as_ref().cloned(),
+                        "dir" => cfg.dir.clone(),
+                        "dbfilename" => cfg.dbfilename.clone(),
                         _ => None,
                     };
                     let bulk_strs =
                         vec![Message::BulkStrings(Some(key)), Message::BulkStrings(value)];
                     socket.send(Message::Arrays(bulk_strs)).await?;
+                }
+                Command::KEYS(pattern) => {
+                    info!("received commadn KEYS with pattern: {}", pattern);
+                    let keys = {
+                        let db = db.read().await;
+                        db.kv.keys().cloned().collect::<Vec<String>>()
+                    };
+                    let keys = keys
+                        .into_iter()
+                        .filter(|key| simple_pattern_match(&pattern, key))
+                        .map(|key| Message::BulkStrings(Some(key)))
+                        .collect::<Vec<Message>>();
+                    socket.send(Message::Arrays(keys)).await?;
                 }
                 cmd => {
                     error!("unsupported command: {:?}", cmd);
@@ -144,4 +158,20 @@ async fn process_socket(
             }
         }
     }
+}
+
+fn simple_pattern_match(pattern: &str, key: &str) -> bool {
+    if pattern == "*" {
+        return true;
+    }
+    if pattern.starts_with("*") && pattern.ends_with("*") {
+        return key.contains(&pattern[1..pattern.len() - 1]);
+    }
+    if pattern.starts_with("*") {
+        return key.ends_with(&pattern[1..]);
+    }
+    if pattern.ends_with("*") {
+        return key.starts_with(&pattern[..pattern.len() - 1]);
+    }
+    false
 }

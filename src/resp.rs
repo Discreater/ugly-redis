@@ -1,7 +1,7 @@
 use bytes::Buf;
 use std::{io, time::Duration};
 use tokio_util::codec::{Decoder, Encoder};
-use tracing::{debug, error};
+use tracing::{debug, error, trace};
 
 const CRLF: &'static [u8] = b"\r\n";
 
@@ -15,6 +15,7 @@ pub enum Command {
         value: String,
         px: Option<Duration>,
     },
+    KEYS(String),
     Config(ConfigComand),
     Get(String),
 }
@@ -23,6 +24,15 @@ pub enum Command {
 #[non_exhaustive]
 pub enum ConfigComand {
     GET(String),
+}
+
+impl From<Message> for io::Error {
+    fn from(message: Message) -> io::Error {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("invalid message: {:?}", message),
+        )
+    }
 }
 
 impl Command {
@@ -38,12 +48,7 @@ impl Command {
                     let message = messages.next().ok_or_else(|| {
                         io::Error::new(io::ErrorKind::InvalidData, "missing ECHO data")
                     })?;
-                    let data = message.get_string().map_err(|m| {
-                        io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            format!("invalid message: {:?}", m),
-                        )
-                    })?;
+                    let data = message.get_string()?;
                     Ok(Command::Echo(data))
                 }
                 "SET" => {
@@ -52,25 +57,13 @@ impl Command {
                         .ok_or_else(|| {
                             io::Error::new(io::ErrorKind::InvalidData, "missing SET key")
                         })?
-                        .get_string()
-                        .map_err(|m| {
-                            io::Error::new(
-                                io::ErrorKind::InvalidData,
-                                format!("invalid message: {:?}", m),
-                            )
-                        })?;
+                        .get_string()?;
                     let value = messages
                         .next()
                         .ok_or_else(|| {
                             io::Error::new(io::ErrorKind::InvalidData, "missing SET value")
                         })?
-                        .get_string()
-                        .map_err(|m| {
-                            io::Error::new(
-                                io::ErrorKind::InvalidData,
-                                format!("invalid message: {:?}", m),
-                            )
-                        })?;
+                        .get_string()?;
                     let mut px = None;
                     while let Some(message) = messages.next() {
                         match message.get_string() {
@@ -84,13 +77,7 @@ impl Command {
                                                 "missing PX value",
                                             )
                                         })?
-                                        .get_string()
-                                        .map_err(|m| {
-                                            io::Error::new(
-                                                io::ErrorKind::InvalidData,
-                                                format!("invalid message: {:?}", m),
-                                            )
-                                        })?;
+                                        .get_string()?;
                                     match data.parse::<u64>() {
                                         Ok(ms) => {
                                             px = Some(Duration::from_millis(ms));
@@ -117,14 +104,17 @@ impl Command {
                         .ok_or_else(|| {
                             io::Error::new(io::ErrorKind::InvalidData, "missing GET key")
                         })?
-                        .get_string()
-                        .map_err(|m| {
-                            io::Error::new(
-                                io::ErrorKind::InvalidData,
-                                format!("invalid message: {:?}", m),
-                            )
-                        })?;
+                        .get_string()?;
                     Ok(Command::Get(key))
+                }
+                "KEYS" => {
+                    let pattern = messages
+                        .next()
+                        .ok_or_else(|| {
+                            io::Error::new(io::ErrorKind::InvalidData, "missing KEYS pattern")
+                        })?
+                        .get_string()?;
+                    Ok(Command::KEYS(pattern))
                 }
                 "CONFIG" => {
                     let sub_command = messages
@@ -132,13 +122,7 @@ impl Command {
                         .ok_or_else(|| {
                             io::Error::new(io::ErrorKind::InvalidData, "missing CONFIG sub command")
                         })?
-                        .get_string()
-                        .map_err(|m| {
-                            io::Error::new(
-                                io::ErrorKind::InvalidData,
-                                format!("invalid message: {:?}", m),
-                            )
-                        })?;
+                        .get_string()?;
                     match sub_command.to_uppercase().as_str() {
                         "GET" => {
                             let key = messages
@@ -149,13 +133,7 @@ impl Command {
                                         "missing CONFIG GET key",
                                     )
                                 })?
-                                .get_string()
-                                .map_err(|m| {
-                                    io::Error::new(
-                                        io::ErrorKind::InvalidData,
-                                        format!("invalid message: {:?}", m),
-                                    )
-                                })?;
+                                .get_string()?;
                             Ok(Command::Config(ConfigComand::GET(key)))
                         }
                         _ => Err(io::Error::new(
@@ -291,7 +269,7 @@ impl Parser<'_> {
         // The first (and sometimes also the second) bulk string in the array is the command's name.
         // Subsequent elements of the array are the arguments for the command.
         if self.remain().is_empty() {
-            debug!("remain is empty");
+            trace!("remain is empty");
             return Ok(None);
         }
         let data_type = self.consume_one_unchecked();
