@@ -15,9 +15,10 @@ pub enum Command {
         value: String,
         px: Option<Duration>,
     },
+    Get(String),
     KEYS(String),
     Config(ConfigComand),
-    Get(String),
+    Info(Option<String>),
 }
 
 #[derive(Debug)]
@@ -140,6 +141,14 @@ impl Command {
                             io::ErrorKind::InvalidData,
                             format!("unsupported CONFIG sub command: {}", sub_command),
                         )),
+                    }
+                }
+                "INFO" => {
+                    if let Some(section) = messages.next() {
+                        let section = section.get_string()?;
+                        Ok(Command::Info(Some(section)))
+                    } else {
+                        Ok(Command::Info(None))
                     }
                 }
                 _ => Err(io::Error::new(

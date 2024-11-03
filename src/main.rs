@@ -5,6 +5,7 @@ use redis_starter_rust::{
     resp::{Command, ConfigComand, Message, MessageFramer},
 };
 use std::{
+    collections::HashMap,
     io,
     net::{Ipv4Addr, SocketAddrV4},
     sync::Arc,
@@ -154,6 +155,30 @@ async fn process_socket(socket: TcpStream, db: Arc<RwLock<Db>>, cfg: Arc<Args>) 
                         .collect::<Vec<Message>>();
                     socket.send(Message::Arrays(keys)).await?;
                 }
+                Command::Info(section) => {
+                    info!("received command INFO with section: {:?}", section);
+                    match section.as_ref().map(|s| s.as_str()) {
+                        Some("replication") => {
+                            let info = replication_info()
+                                .into_iter()
+                                .map(|(k, v)| format!("{}:{}", k, v))
+                                .collect::<Vec<String>>()
+                                .join("\r\n");
+                            socket.send(Message::BulkStrings(Some(info))).await?;
+                        }
+                        None => {
+                            let info = all_info()
+                                .into_iter()
+                                .map(|(k, v)| format!("{}:{}", k, v))
+                                .collect::<Vec<String>>()
+                                .join("\r\n");
+                            socket.send(Message::BulkStrings(Some(info))).await?;
+                        }
+                        s => {
+                            error!("unsupported INFO section: {:?}", s);
+                        }
+                    }
+                }
                 cmd => {
                     error!("unsupported command: {:?}", cmd);
                 }
@@ -163,6 +188,16 @@ async fn process_socket(socket: TcpStream, db: Arc<RwLock<Db>>, cfg: Arc<Args>) 
             }
         }
     }
+}
+
+fn replication_info() -> HashMap<String, String> {
+    let mut info = HashMap::new();
+    info.insert("role".to_string(), "master".to_string());
+    info
+}
+
+fn all_info() -> HashMap<String, String> {
+    replication_info()
 }
 
 fn simple_pattern_match(pattern: &str, key: &str) -> bool {
