@@ -28,6 +28,8 @@ struct Args {
     dbfilename: Option<String>,
     #[arg(long, default_value = "6379")]
     port: u16,
+    #[arg(long)]
+    replicaof: Option<String>,
 }
 
 #[tokio::main]
@@ -159,7 +161,7 @@ async fn process_socket(socket: TcpStream, db: Arc<RwLock<Db>>, cfg: Arc<Args>) 
                     info!("received command INFO with section: {:?}", section);
                     match section.as_ref().map(|s| s.as_str()) {
                         Some("replication") => {
-                            let info = replication_info()
+                            let info = replication_info(&cfg)
                                 .into_iter()
                                 .map(|(k, v)| format!("{}:{}", k, v))
                                 .collect::<Vec<String>>()
@@ -167,7 +169,7 @@ async fn process_socket(socket: TcpStream, db: Arc<RwLock<Db>>, cfg: Arc<Args>) 
                             socket.send(Message::BulkStrings(Some(info))).await?;
                         }
                         None => {
-                            let info = all_info()
+                            let info = all_info(&cfg)
                                 .into_iter()
                                 .map(|(k, v)| format!("{}:{}", k, v))
                                 .collect::<Vec<String>>()
@@ -190,14 +192,18 @@ async fn process_socket(socket: TcpStream, db: Arc<RwLock<Db>>, cfg: Arc<Args>) 
     }
 }
 
-fn replication_info() -> HashMap<String, String> {
+fn replication_info(cfg: &Args) -> HashMap<String, String> {
     let mut info = HashMap::new();
-    info.insert("role".to_string(), "master".to_string());
+    if cfg.replicaof.is_some() {
+        info.insert("role".to_string(), "slave".to_string());
+    } else {
+        info.insert("role".to_string(), "master".to_string());
+    }
     info
 }
 
-fn all_info() -> HashMap<String, String> {
-    replication_info()
+fn all_info(cfg: &Args) -> HashMap<String, String> {
+    replication_info(cfg)
 }
 
 fn simple_pattern_match(pattern: &str, key: &str) -> bool {
