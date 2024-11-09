@@ -5,6 +5,9 @@ use tracing::{error, trace};
 
 const CRLF: &'static [u8] = b"\r\n";
 
+type ReplId = String;
+type ReplOffset = usize;
+
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum ReqCommand {
@@ -20,6 +23,10 @@ pub enum ReqCommand {
     Config(ConfigSubCommand),
     Info(Option<String>),
     Replconf(ReplconfSubcommand),
+    Psync {
+        id: Option<ReplId>,
+        offset: Option<ReplOffset>,
+    },
 }
 
 #[derive(Debug)]
@@ -33,6 +40,7 @@ pub enum ReplconfSubcommand {
 pub enum RespCommand {
     Pong,
     Ok,
+    FullResync,
     Bulk(String),
     Bulks(Vec<Option<String>>),
     Nil,
@@ -185,8 +193,31 @@ impl ReqCommand {
 impl RespCommand {
     fn parse(message: Message) -> Result<Self, io::Error> {
         match message {
-            Message::SimpleStrings(s) if s.to_uppercase() == "PONG" => Ok(RespCommand::Pong),
-            Message::SimpleStrings(s) if s.to_uppercase() == "OK" => Ok(RespCommand::Ok),
+            Message::SimpleStrings(s) => {
+                let upper_s = s.to_ascii_uppercase();
+                if upper_s == "PONG" {
+                    Ok(RespCommand::Pong)
+                } else if upper_s == "OK" {
+                    Ok(RespCommand::Ok)
+                } else {
+                    if upper_s.starts_with("FULLRESYNC") {
+                        let splitted: Vec<&str> = upper_s.split(' ').collect();
+                        if splitted.len() != 3 {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                format!("invalid fullresync message: {:?}", s),
+                            ));
+                        } else {
+                            Ok(RespCommand::FullResync)
+                        }
+                    } else {
+                        Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("unsupported simple string message: {:?}", s),
+                        ))
+                    }
+                }
+            }
             Message::BulkStrings(Some(s)) => Ok(RespCommand::Bulk(s)),
             Message::BulkStrings(None) => Ok(RespCommand::Nil),
             Message::Arrays(v) => v
@@ -292,6 +323,7 @@ impl Encoder<RespCommand> for Slave {
             }
             RespCommand::Simple(s) => Message::SimpleStrings(s.to_string()).encode_to(dst),
             RespCommand::Nil => Message::BulkStrings(None).encode_to(dst),
+            RespCommand::FullResync => todo!(),
         }
     }
 }
@@ -381,6 +413,19 @@ impl Encoder<ReqCommand> for Master {
                 };
                 messages.append(&mut subs);
                 Message::Arrays(messages)
+            }
+            ReqCommand::Psync { id, offset } => {
+                let id = Message::BulkStrings(Some(id.unwrap_or("?".to_string())));
+                let offset = Message::BulkStrings(Some(
+                    offset
+                        .map(|offset| offset.to_string())
+                        .unwrap_or("-1".to_string()),
+                ));
+                Message::Arrays(vec![
+                    Message::SimpleStrings("PSYNC".to_string()),
+                    id,
+                    offset,
+                ])
             }
         }
         .encode_to(dst)

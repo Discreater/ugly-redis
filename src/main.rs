@@ -102,6 +102,18 @@ async fn main() -> anyhow::Result<()> {
             .await
             .context("connection closed by master")??;
         debug_assert!(matches!(response, RespCommand::Ok));
+
+        master
+            .send(ReqCommand::Psync {
+                id: None,
+                offset: None,
+            })
+            .await?;
+        let response = master
+            .next()
+            .await
+            .context("connection closed by master")??;
+        debug_assert!(matches!(response, RespCommand::FullResync));
     }
 
     loop {
