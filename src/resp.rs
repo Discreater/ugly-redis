@@ -40,7 +40,7 @@ pub enum ReplconfSubcommand {
 pub enum RespCommand {
     Pong,
     Ok,
-    FullResync,
+    FullResync { repl_id: String, offset: usize },
     Bulk(String),
     Bulks(Vec<Option<String>>),
     Nil,
@@ -226,6 +226,31 @@ impl ReqCommand {
                         )),
                     }
                 }
+                "PSYNC" => {
+                    let id = messages
+                        .next()
+                        .ok_or_else(|| {
+                            io::Error::new(io::ErrorKind::InvalidData, "missing PSYNC id")
+                        })?
+                        .get_string()?;
+                    let id = if id == "?" { None } else { Some(id) };
+                    let offset = messages
+                        .next()
+                        .ok_or_else(|| {
+                            io::Error::new(io::ErrorKind::InvalidData, "missing PSYNC offset")
+                        })?
+                        .get_string()?;
+                    let offset = if offset == "-1" {
+                        None
+                    } else {
+                        Some(
+                            offset
+                                .parse()
+                                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?,
+                        )
+                    };
+                    Ok(ReqCommand::Psync { id, offset })
+                }
                 _ => Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!("unsupported command: {}", data),
@@ -256,9 +281,19 @@ impl RespCommand {
                                 io::ErrorKind::InvalidData,
                                 format!("invalid fullresync message: {:?}", s),
                             ));
-                        } else {
-                            Ok(RespCommand::FullResync)
                         }
+                        let id = splitted[1].to_string();
+                        let offset = splitted[2].parse().map_err(|e| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                format!("invalid offset: {}", e),
+                            )
+                        })?;
+
+                        Ok(RespCommand::FullResync {
+                            repl_id: id,
+                            offset,
+                        })
                     } else {
                         Err(io::Error::new(
                             io::ErrorKind::InvalidData,
@@ -372,7 +407,9 @@ impl Encoder<RespCommand> for Slave {
             }
             RespCommand::Simple(s) => Message::SimpleStrings(s.to_string()).encode_to(dst),
             RespCommand::Nil => Message::BulkStrings(None).encode_to(dst),
-            RespCommand::FullResync => todo!(),
+            RespCommand::FullResync { repl_id, offset } => {
+                Message::SimpleStrings(format!("FULLRESYNC {} {}", repl_id, offset)).encode_to(dst)
+            }
         }
     }
 }

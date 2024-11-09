@@ -113,7 +113,7 @@ async fn main() -> anyhow::Result<()> {
             .next()
             .await
             .context("connection closed by master")??;
-        debug_assert!(matches!(response, RespCommand::FullResync));
+        debug_assert!(matches!(response, RespCommand::FullResync { .. }));
     }
 
     loop {
@@ -245,6 +245,15 @@ async fn process_socket(socket: TcpStream, db: Arc<RwLock<Db>>, cfg: Arc<Args>) 
             ReqCommand::Replconf(subc) => {
                 info!("recieved command REPLCONF: {:?}", subc);
                 socket.send(RespCommand::Ok).await?;
+            }
+            ReqCommand::Psync { id, offset } => {
+                info!("recieved command PSYNC, id: {:?}, offset: {:?}", id, offset);
+                socket
+                    .send(RespCommand::FullResync {
+                        repl_id: REPLICATION_ID.to_string(),
+                        offset: 0,
+                    })
+                    .await?;
             }
             cmd => {
                 error!("unsupported command: {:?}", cmd);
