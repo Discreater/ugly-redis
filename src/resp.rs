@@ -1,5 +1,5 @@
 use bytes::Buf;
-use std::{io, time::Duration};
+use std::{io, time::Duration, vec};
 use tokio_util::codec::{Decoder, Encoder};
 use tracing::{error, trace};
 
@@ -7,7 +7,7 @@ const CRLF: &'static [u8] = b"\r\n";
 
 #[derive(Debug)]
 #[non_exhaustive]
-pub enum Command {
+pub enum ReqCommand {
     Ping,
     Echo(String),
     Set {
@@ -17,13 +17,31 @@ pub enum Command {
     },
     Get(String),
     KEYS(String),
-    Config(ConfigComand),
+    Config(ConfigSubCommand),
     Info(Option<String>),
+    Replconf(ReplconfSubcommand),
+}
+
+#[derive(Debug)]
+pub enum ReplconfSubcommand {
+    ListeningPort(u16),
+    Capa(String),
 }
 
 #[derive(Debug)]
 #[non_exhaustive]
-pub enum ConfigComand {
+pub enum RespCommand {
+    Pong,
+    Ok,
+    Bulk(String),
+    Bulks(Vec<Option<String>>),
+    Nil,
+    Simple(&'static str),
+}
+
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum ConfigSubCommand {
     GET(String),
 }
 
@@ -36,21 +54,21 @@ impl From<Message> for io::Error {
     }
 }
 
-impl Command {
-    pub fn from(messages: Vec<Message>) -> Result<Self, std::io::Error> {
+impl ReqCommand {
+    fn parse(messages: Vec<Message>) -> Result<Self, std::io::Error> {
         let mut messages = messages.into_iter();
         let message = messages
             .next()
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "empty messages"))?;
         match message {
             Message::BulkStrings(Some(data)) => match data.to_uppercase().as_str() {
-                "PING" => Ok(Command::Ping),
+                "PING" => Ok(ReqCommand::Ping),
                 "ECHO" => {
                     let message = messages.next().ok_or_else(|| {
                         io::Error::new(io::ErrorKind::InvalidData, "missing ECHO data")
                     })?;
                     let data = message.get_string()?;
-                    Ok(Command::Echo(data))
+                    Ok(ReqCommand::Echo(data))
                 }
                 "SET" => {
                     let key = messages
@@ -97,7 +115,7 @@ impl Command {
                             }
                         }
                     }
-                    Ok(Command::Set { key, value, px })
+                    Ok(ReqCommand::Set { key, value, px })
                 }
                 "GET" => {
                     let key = messages
@@ -106,7 +124,7 @@ impl Command {
                             io::Error::new(io::ErrorKind::InvalidData, "missing GET key")
                         })?
                         .get_string()?;
-                    Ok(Command::Get(key))
+                    Ok(ReqCommand::Get(key))
                 }
                 "KEYS" => {
                     let pattern = messages
@@ -115,7 +133,7 @@ impl Command {
                             io::Error::new(io::ErrorKind::InvalidData, "missing KEYS pattern")
                         })?
                         .get_string()?;
-                    Ok(Command::KEYS(pattern))
+                    Ok(ReqCommand::KEYS(pattern))
                 }
                 "CONFIG" => {
                     let sub_command = messages
@@ -135,7 +153,7 @@ impl Command {
                                     )
                                 })?
                                 .get_string()?;
-                            Ok(Command::Config(ConfigComand::GET(key)))
+                            Ok(ReqCommand::Config(ConfigSubCommand::GET(key)))
                         }
                         _ => Err(io::Error::new(
                             io::ErrorKind::InvalidData,
@@ -146,9 +164,9 @@ impl Command {
                 "INFO" => {
                     if let Some(section) = messages.next() {
                         let section = section.get_string()?;
-                        Ok(Command::Info(Some(section)))
+                        Ok(ReqCommand::Info(Some(section)))
                     } else {
-                        Ok(Command::Info(None))
+                        Ok(ReqCommand::Info(None))
                     }
                 }
                 _ => Err(io::Error::new(
@@ -164,8 +182,36 @@ impl Command {
     }
 }
 
+impl RespCommand {
+    fn parse(message: Message) -> Result<Self, io::Error> {
+        match message {
+            Message::SimpleStrings(s) if s.to_uppercase() == "PONG" => Ok(RespCommand::Pong),
+            Message::SimpleStrings(s) if s.to_uppercase() == "OK" => Ok(RespCommand::Ok),
+            Message::BulkStrings(Some(s)) => Ok(RespCommand::Bulk(s)),
+            Message::BulkStrings(None) => Ok(RespCommand::Nil),
+            Message::Arrays(v) => v
+                .into_iter()
+                .map(|message| match message {
+                    Message::BulkStrings(Some(s)) => Ok(Some(s)),
+                    Message::BulkStrings(None) => Ok(None),
+                    _ => Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("unsupported message: {:?}", message),
+                    )),
+                })
+                .collect::<Result<Vec<Option<String>>, io::Error>>()
+                .map(RespCommand::Bulks),
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unsupported message: {:?}", message),
+            )),
+        }
+    }
+}
+
+#[allow(dead_code)]
 #[derive(Debug, PartialEq)]
-pub enum Message {
+enum Message {
     // RESP2 	Simple 	+
     SimpleStrings(String),
     // RESP2 	Simple 	-
@@ -199,7 +245,7 @@ pub enum Message {
 }
 
 impl Message {
-    pub fn get_string(self) -> Result<String, Self> {
+    fn get_string(self) -> Result<String, Self> {
         Ok(match self {
             Message::BulkStrings(Some(data)) => data,
             Message::SimpleStrings(data) => data,
@@ -208,34 +254,148 @@ impl Message {
     }
 }
 
-pub struct MessageFramer;
+pub struct Slave;
 
-impl Decoder for MessageFramer {
-    type Item = Message;
+impl Decoder for Slave {
+    type Item = ReqCommand;
     type Error = std::io::Error;
 
     fn decode(&mut self, src: &mut bytes::BytesMut) -> Result<Option<Self::Item>, Self::Error> {
         let mut parser = Parser::new(src);
         let message = parser.parse()?;
-        if message.is_none() {
-            return Ok(None);
+
+        if let Some(message) = message {
+            src.advance(parser.idx);
+            match message {
+                Message::Arrays(messages) => Ok(Some(ReqCommand::parse(messages)?)),
+                message => Err(std::io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    format!("unsupported top message: {:?}", message),
+                )),
+            }
+        } else {
+            Ok(None)
         }
-        src.advance(parser.idx);
-        Ok(message)
     }
 }
 
-impl Encoder<Message> for MessageFramer {
+impl Encoder<RespCommand> for Slave {
     type Error = std::io::Error;
 
-    fn encode(&mut self, item: Message, dst: &mut bytes::BytesMut) -> Result<(), Self::Error> {
+    fn encode(&mut self, item: RespCommand, dst: &mut bytes::BytesMut) -> Result<(), Self::Error> {
         match item {
+            RespCommand::Pong => Message::SimpleStrings("PONG".to_string()).encode_to(dst),
+            RespCommand::Ok => Message::SimpleStrings("OK".to_string()).encode_to(dst),
+            RespCommand::Bulk(s) => Message::BulkStrings(Some(s)).encode_to(dst),
+            RespCommand::Bulks(v) => {
+                Message::Arrays(v.into_iter().map(Message::BulkStrings).collect()).encode_to(dst)
+            }
+            RespCommand::Simple(s) => Message::SimpleStrings(s.to_string()).encode_to(dst),
+            RespCommand::Nil => Message::BulkStrings(None).encode_to(dst),
+        }
+    }
+}
+
+pub struct Master;
+
+impl Decoder for Master {
+    type Item = RespCommand;
+
+    type Error = std::io::Error;
+
+    fn decode(&mut self, src: &mut bytes::BytesMut) -> Result<Option<Self::Item>, Self::Error> {
+        let mut parser = Parser::new(src);
+        let message = parser.parse()?;
+        if let Some(message) = message {
+            src.advance(parser.idx);
+            Ok(Some(RespCommand::parse(message)?))
+        } else {
+            Ok(None)
+        }
+    }
+}
+
+impl Encoder<ReqCommand> for Master {
+    type Error = std::io::Error;
+
+    fn encode(&mut self, item: ReqCommand, dst: &mut bytes::BytesMut) -> Result<(), Self::Error> {
+        match item {
+            ReqCommand::Ping => Message::Arrays(vec![Message::SimpleStrings("PING".to_string())]),
+            ReqCommand::Config(cfg) => match cfg {
+                ConfigSubCommand::GET(key) => Message::Arrays(vec![
+                    Message::SimpleStrings("CONFIG".to_string()),
+                    Message::SimpleStrings("GET".to_string()),
+                    Message::SimpleStrings(key),
+                ]),
+            },
+            ReqCommand::Echo(data) => Message::Arrays(vec![
+                Message::SimpleStrings("ECHO".to_string()),
+                Message::SimpleStrings(data),
+            ]),
+            ReqCommand::Get(key) => Message::Arrays(vec![
+                Message::SimpleStrings("GET".to_string()),
+                Message::SimpleStrings(key),
+            ]),
+            ReqCommand::Info(key) => {
+                if let Some(key) = key {
+                    Message::Arrays(vec![
+                        Message::SimpleStrings("INFO".to_string()),
+                        Message::SimpleStrings(key),
+                    ])
+                } else {
+                    Message::Arrays(vec![Message::SimpleStrings("INFO".to_string())])
+                }
+            }
+            ReqCommand::KEYS(pattern) => Message::Arrays(vec![
+                Message::SimpleStrings("KEYS".to_string()),
+                Message::SimpleStrings(pattern),
+            ]),
+            ReqCommand::Set { key, value, px } => {
+                let mut messages = vec![
+                    Message::SimpleStrings("SET".to_string()),
+                    Message::SimpleStrings(key),
+                    Message::SimpleStrings(value),
+                ];
+                if let Some(px) = px {
+                    messages.push(Message::SimpleStrings("PX".to_string()));
+                    messages.push(Message::SimpleStrings(px.as_millis().to_string()));
+                }
+                Message::Arrays(messages)
+            }
+            ReqCommand::Replconf(repl) => {
+                let mut messages = vec![Message::SimpleStrings("REPLCONF".to_string())];
+
+                let mut subs = match repl {
+                    ReplconfSubcommand::ListeningPort(port) => {
+                        vec![
+                            Message::SimpleStrings("listening-port".to_string()),
+                            Message::SimpleStrings(port.to_string()),
+                        ]
+                    }
+                    ReplconfSubcommand::Capa(capa) => {
+                        vec![
+                            Message::SimpleStrings("capa".to_string()),
+                            Message::BulkStrings(Some(capa.to_string())),
+                        ]
+                    }
+                };
+                messages.append(&mut subs);
+                Message::Arrays(messages)
+            }
+        }
+        .encode_to(dst)
+    }
+}
+
+impl Message {
+    fn encode_to(self, dst: &mut bytes::BytesMut) -> Result<(), io::Error> {
+        match self {
             Message::Arrays(messages) => {
                 dst.extend_from_slice(b"*");
                 dst.extend_from_slice(messages.len().to_string().as_bytes());
                 dst.extend_from_slice(CRLF);
                 for message in messages {
-                    self.encode(message, dst)?;
+                    message.encode_to(dst)?;
                 }
             }
             Message::BulkStrings(Some(data)) => {
@@ -250,12 +410,14 @@ impl Encoder<Message> for MessageFramer {
                 dst.extend_from_slice(CRLF);
             }
             Message::SimpleStrings(data) => {
+                debug_assert!(data.find('\r').is_none());
+                debug_assert!(data.find('\n').is_none());
                 dst.extend_from_slice(b"+");
                 dst.extend_from_slice(data.as_bytes());
                 dst.extend_from_slice(CRLF);
             }
             _ => {
-                error!("unsupported message: {:?}", item);
+                error!("unsupported message: {:?}", self);
                 unimplemented!()
             }
         }
@@ -315,6 +477,22 @@ impl Parser<'_> {
                     }
                 } else {
                     return Ok(Some(Message::BulkStrings(None)));
+                }
+            }
+            b'+' => {
+                let end = self.remain().iter().position(|&b| b == b'\r');
+                if let Some(end) = end {
+                    let data = self.advance_unchecked(end);
+                    let data = String::from_utf8(data.to_vec()).map_err(|_| {
+                        io::Error::new(io::ErrorKind::InvalidData, "invalid utf8 string")
+                    })?;
+                    if !self.remain().starts_with(CRLF) {
+                        return Err(io::Error::new(io::ErrorKind::InvalidData, "expected CRLF"));
+                    }
+                    self.idx += 2;
+                    return Ok(Some(Message::SimpleStrings(data)));
+                } else {
+                    Ok(None)
                 }
             }
             _ => {

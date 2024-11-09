@@ -200,26 +200,6 @@ fn parse_string(buf: &mut Bytes) -> ParseResult<String> {
     }
 }
 
-fn parse_strings(buf: &mut Bytes) -> ParseResult<Vec<String>> {
-    let mut strings = vec![];
-    loop {
-        if buf.is_empty() {
-            break;
-        }
-        let head = buf[0];
-        match head {
-            AUX | SELECTDB | EXPIRETIME | OBJECTIDLETIME | RESIZEDB => {
-                break;
-            }
-            _ => {
-                let s = parse_string(buf)?;
-                strings.push(s);
-            }
-        }
-    }
-    Ok(strings)
-}
-
 fn require_u8(buf: &mut Bytes, expect: u8) -> ParseResult<()> {
     let actual = safe_u8(buf)?;
     if actual != expect {

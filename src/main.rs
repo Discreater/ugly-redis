@@ -1,8 +1,9 @@
+use anyhow::Context;
 use futures_util::{SinkExt, StreamExt};
 use redis_starter_rust::{
     db::Db,
     rdb,
-    resp::{Command, ConfigComand, Message, MessageFramer},
+    resp::{ConfigSubCommand, Master, ReplconfSubcommand, ReqCommand, RespCommand, Slave},
 };
 use std::{
     collections::HashMap,
@@ -52,7 +53,7 @@ impl Args {
 }
 
 #[tokio::main]
-async fn main() -> io::Result<()> {
+async fn main() -> anyhow::Result<()> {
     let log_level = if std::env::var("REDIS_LOG").is_ok() {
         Level::TRACE
     } else {
@@ -60,7 +61,8 @@ async fn main() -> io::Result<()> {
     };
     tracing_subscriber::fmt().with_max_level(log_level).init();
     let args = Args::parse();
-    let db = rdb::init(&args.dir, &args.dbfilename)?;
+    let db =
+        rdb::init(&args.dir, &args.dbfilename).context("init from redis database file error")?;
 
     let listener = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), args.port))
         .await
@@ -69,13 +71,37 @@ async fn main() -> io::Result<()> {
     let config = Arc::new(args);
 
     if let Some(replicaof) = &config.replicaof {
-        let master = TcpStream::connect(replicaof).await?;
-        let mut master = tokio_util::codec::Framed::new(master, MessageFramer);
+        let master = TcpStream::connect(replicaof)
+            .await
+            .context("cannot connect to master")?;
+        let mut master = tokio_util::codec::Framed::new(master, Master);
+        master.send(ReqCommand::Ping).await?;
+        let response = master
+            .next()
+            .await
+            .context("connection closed by master")?
+            .context("decode response message error")?;
+        debug_assert!(matches!(response, RespCommand::Pong));
         master
-            .send(Message::Arrays(vec![Message::SimpleStrings(
-                "PING".to_string(),
-            )]))
+            .send(ReqCommand::Replconf(ReplconfSubcommand::ListeningPort(
+                config.port,
+            )))
             .await?;
+        let response = master
+            .next()
+            .await
+            .context("connection closed by master")??;
+        debug_assert!(matches!(response, RespCommand::Ok));
+        master
+            .send(ReqCommand::Replconf(ReplconfSubcommand::Capa(
+                "psync2".to_string(),
+            )))
+            .await?;
+        let response = master
+            .next()
+            .await
+            .context("connection closed by master")??;
+        debug_assert!(matches!(response, RespCommand::Ok));
     }
 
     loop {
@@ -91,7 +117,7 @@ async fn main() -> io::Result<()> {
 }
 
 async fn process_socket(socket: TcpStream, db: Arc<RwLock<Db>>, cfg: Arc<Args>) -> io::Result<()> {
-    let mut socket = tokio_util::codec::Framed::new(socket, MessageFramer);
+    let mut socket = tokio_util::codec::Framed::new(socket, Slave);
 
     loop {
         let message = match socket.next().await {
@@ -103,119 +129,109 @@ async fn process_socket(socket: TcpStream, db: Arc<RwLock<Db>>, cfg: Arc<Args>) 
         };
 
         match message {
-            Message::Arrays(messages) => match Command::from(messages)? {
-                Command::Ping => {
-                    info!("received command PING");
-                    socket
-                        .send(Message::SimpleStrings("PONG".to_string()))
-                        .await?;
-                }
-                Command::Echo(data) => {
-                    info!("received command ECHO with data: {}", data);
-                    socket.send(Message::BulkStrings(Some(data))).await?;
-                }
-                Command::Get(key) => {
-                    info!("received command GET with key: {}", key);
-                    let (value, expire) = {
-                        let db = db.read().await;
-                        (db.kv.get(&key).cloned(), db.expire.get(&key).cloned())
-                    };
-                    let value = if let Some(value) = value {
-                        if let Some(expire) = expire {
-                            if UNIX_EPOCH + Duration::from_millis(expire)
-                                < std::time::SystemTime::now()
-                            {
-                                None
-                            } else {
-                                Some(value)
-                            }
+            ReqCommand::Ping => {
+                info!("received command PING");
+                socket.send(RespCommand::Pong).await?;
+            }
+            ReqCommand::Echo(data) => {
+                info!("received command ECHO with data: {}", data);
+                socket.send(RespCommand::Bulk(data)).await?;
+            }
+            ReqCommand::Get(key) => {
+                info!("received command GET with key: {}", key);
+                let (value, expire) = {
+                    let db = db.read().await;
+                    (db.kv.get(&key).cloned(), db.expire.get(&key).cloned())
+                };
+                let value = if let Some(value) = value {
+                    if let Some(expire) = expire {
+                        if UNIX_EPOCH + Duration::from_millis(expire) < std::time::SystemTime::now()
+                        {
+                            RespCommand::Nil
                         } else {
-                            Some(value)
+                            RespCommand::Bulk(value)
                         }
                     } else {
-                        None
-                    };
-                    socket.send(Message::BulkStrings(value)).await?;
-                }
-                Command::Set { key, value, px } => {
-                    info!(
-                        "received command SET with key: {} and value: {}, px: {:?}",
-                        key, value, px
-                    );
-                    let expired_time = px.and_then(|px| {
-                        (std::time::SystemTime::now() + px)
-                            .duration_since(UNIX_EPOCH)
-                            .ok()
-                            .map(|d| d.as_millis() as u64)
-                    });
-                    {
-                        let mut db = db.write().await;
-                        db.kv.insert(key.clone(), value);
+                        RespCommand::Bulk(value)
+                    }
+                } else {
+                    RespCommand::Nil
+                };
+                socket.send(value).await?;
+            }
+            ReqCommand::Set { key, value, px } => {
+                info!(
+                    "received command SET with key: {} and value: {}, px: {:?}",
+                    key, value, px
+                );
+                let expired_time = px.and_then(|px| {
+                    (std::time::SystemTime::now() + px)
+                        .duration_since(UNIX_EPOCH)
+                        .ok()
+                        .map(|d| d.as_millis() as u64)
+                });
+                {
+                    let mut db = db.write().await;
+                    db.kv.insert(key.clone(), value);
 
-                        if let Some(expired_time) = expired_time {
-                            db.expire.insert(key.clone(), expired_time);
-                        } else {
-                            db.expire.remove_entry(&key);
-                        }
-                    }
-                    socket
-                        .send(Message::SimpleStrings("OK".to_string()))
-                        .await?;
-                }
-                Command::Config(ConfigComand::GET(key)) => {
-                    info!("received command CONFIG GET with key: {}", key);
-                    let value = match key.as_str() {
-                        "dir" => cfg.dir.clone(),
-                        "dbfilename" => cfg.dbfilename.clone(),
-                        _ => None,
-                    };
-                    let bulk_strs =
-                        vec![Message::BulkStrings(Some(key)), Message::BulkStrings(value)];
-                    socket.send(Message::Arrays(bulk_strs)).await?;
-                }
-                Command::KEYS(pattern) => {
-                    info!("received commadn KEYS with pattern: {}", pattern);
-                    let keys = {
-                        let db = db.read().await;
-                        db.kv.keys().cloned().collect::<Vec<String>>()
-                    };
-                    let keys = keys
-                        .into_iter()
-                        .filter(|key| simple_pattern_match(&pattern, key))
-                        .map(|key| Message::BulkStrings(Some(key)))
-                        .collect::<Vec<Message>>();
-                    socket.send(Message::Arrays(keys)).await?;
-                }
-                Command::Info(section) => {
-                    info!("received command INFO with section: {:?}", section);
-                    match section.as_ref().map(|s| s.as_str()) {
-                        Some("replication") => {
-                            let info = replication_info(&cfg)
-                                .into_iter()
-                                .map(|(k, v)| format!("{}:{}", k, v))
-                                .collect::<Vec<String>>()
-                                .join("\r\n");
-                            socket.send(Message::BulkStrings(Some(info))).await?;
-                        }
-                        None => {
-                            let info = all_info(&cfg)
-                                .into_iter()
-                                .map(|(k, v)| format!("{}:{}", k, v))
-                                .collect::<Vec<String>>()
-                                .join("\r\n");
-                            socket.send(Message::BulkStrings(Some(info))).await?;
-                        }
-                        s => {
-                            error!("unsupported INFO section: {:?}", s);
-                        }
+                    if let Some(expired_time) = expired_time {
+                        db.expire.insert(key.clone(), expired_time);
+                    } else {
+                        db.expire.remove_entry(&key);
                     }
                 }
-                cmd => {
-                    error!("unsupported command: {:?}", cmd);
+                socket.send(RespCommand::Simple("OK")).await?;
+            }
+            ReqCommand::Config(ConfigSubCommand::GET(key)) => {
+                info!("received command CONFIG GET with key: {}", key);
+                let value = match key.as_str() {
+                    "dir" => cfg.dir.clone(),
+                    "dbfilename" => cfg.dbfilename.clone(),
+                    _ => None,
+                };
+                socket
+                    .send(RespCommand::Bulks(vec![Some(key), value]))
+                    .await?;
+            }
+            ReqCommand::KEYS(pattern) => {
+                info!("received commadn KEYS with pattern: {}", pattern);
+                let keys = {
+                    let db = db.read().await;
+                    db.kv.keys().cloned().collect::<Vec<String>>()
+                };
+                let keys = keys
+                    .into_iter()
+                    .filter(|key| simple_pattern_match(&pattern, key))
+                    .map(Option::Some)
+                    .collect();
+                socket.send(RespCommand::Bulks(keys)).await?;
+            }
+            ReqCommand::Info(section) => {
+                info!("received command INFO with section: {:?}", section);
+                match section.as_ref().map(|s| s.as_str()) {
+                    Some("replication") => {
+                        let info = replication_info(&cfg)
+                            .into_iter()
+                            .map(|(k, v)| format!("{}:{}", k, v))
+                            .collect::<Vec<String>>()
+                            .join("\r\n");
+                        socket.send(RespCommand::Bulk(info)).await?;
+                    }
+                    None => {
+                        let info = all_info(&cfg)
+                            .into_iter()
+                            .map(|(k, v)| format!("{}:{}", k, v))
+                            .collect::<Vec<String>>()
+                            .join("\r\n");
+                        socket.send(RespCommand::Bulk(info)).await?;
+                    }
+                    s => {
+                        error!("unsupported INFO section: {:?}", s);
+                    }
                 }
-            },
-            _ => {
-                error!("unsupported message: {:?}", message);
+            }
+            cmd => {
+                error!("unsupported command: {:?}", cmd);
             }
         }
     }
