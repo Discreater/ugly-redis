@@ -41,6 +41,7 @@ pub enum RespCommand {
     Pong,
     Ok,
     FullResync { repl_id: String, offset: usize },
+    RdbFile(Vec<u8>),
     Bulk(String),
     Bulks(Vec<Option<String>>),
     Nil,
@@ -409,6 +410,14 @@ impl Encoder<RespCommand> for Slave {
             RespCommand::Nil => Message::BulkStrings(None).encode_to(dst),
             RespCommand::FullResync { repl_id, offset } => {
                 Message::SimpleStrings(format!("FULLRESYNC {} {}", repl_id, offset)).encode_to(dst)
+            }
+            RespCommand::RdbFile(content) => {
+                // bulk strings withouth the trailing CRLF.
+                dst.extend_from_slice(b"$");
+                dst.extend_from_slice(content.len().to_string().as_bytes());
+                dst.extend_from_slice(CRLF);
+                dst.extend_from_slice(&content);
+                Ok(())
             }
         }
     }
