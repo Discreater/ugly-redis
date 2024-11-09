@@ -242,6 +242,10 @@ async fn process_socket(socket: TcpStream, db: Arc<RwLock<Db>>, cfg: Arc<Args>) 
                     }
                 }
             }
+            ReqCommand::Replconf(subc) => {
+                info!("recieved command REPLCONF: {:?}", subc);
+                socket.send(RespCommand::Ok).await?;
+            }
             cmd => {
                 error!("unsupported command: {:?}", cmd);
             }

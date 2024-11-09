@@ -177,6 +177,55 @@ impl ReqCommand {
                         Ok(ReqCommand::Info(None))
                     }
                 }
+                "REPLCONF" => {
+                    let sub_command = messages
+                        .next()
+                        .ok_or_else(|| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "missing REPLCONF sub command",
+                            )
+                        })?
+                        .get_string()?;
+                    match sub_command.to_uppercase().as_str() {
+                        "LISTENING-PORT" => {
+                            let port = messages
+                                .next()
+                                .ok_or_else(|| {
+                                    io::Error::new(
+                                        io::ErrorKind::InvalidData,
+                                        "missing REPLCONF LISTENING-PORT value",
+                                    )
+                                })?
+                                .get_string()?;
+                            match port.parse::<u16>() {
+                                Ok(port) => Ok(ReqCommand::Replconf(
+                                    ReplconfSubcommand::ListeningPort(port),
+                                )),
+                                Err(_) => Err(io::Error::new(
+                                    io::ErrorKind::InvalidData,
+                                    format!("invalid REPLCONF LISTENING-PORT value: {}", port),
+                                )),
+                            }
+                        }
+                        "CAPA" => {
+                            let capa = messages
+                                .next()
+                                .ok_or_else(|| {
+                                    io::Error::new(
+                                        io::ErrorKind::InvalidData,
+                                        "missing REPLCONF CAPA value",
+                                    )
+                                })?
+                                .get_string()?;
+                            Ok(ReqCommand::Replconf(ReplconfSubcommand::Capa(capa)))
+                        }
+                        _ => Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("unsupported REPLCONF sub command: {}", sub_command),
+                        )),
+                    }
+                }
                 _ => Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!("unsupported command: {}", data),
