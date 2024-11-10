@@ -82,7 +82,7 @@ async fn main() -> anyhow::Result<()> {
             let socket = handshake_with_master(replicaof, config.clone())
                 .await
                 .expect("handshake with master");
-            process_client_socket(socket, db, config, state)
+            process_client_socket::<true>(socket, db, config, state)
                 .await
                 .expect("process socket erorr");
         });
@@ -95,7 +95,7 @@ async fn main() -> anyhow::Result<()> {
         let state = state.clone();
         tokio::spawn(async move {
             let socket = tokio_util::codec::Framed::new(socket, MessageFramer);
-            process_client_socket(socket, db, config, state)
+            process_client_socket::<false>(socket, db, config, state)
                 .await
                 .expect("process socket error")
         });
@@ -184,7 +184,7 @@ async fn handshake_with_master(
     Ok(master)
 }
 
-async fn process_client_socket(
+async fn process_client_socket<const RESPONSE: bool>(
     socket: codec::Framed<TcpStream, MessageFramer>,
     db: Arc<RwLock<Db>>,
     cfg: Arc<Args>,
@@ -260,11 +260,13 @@ async fn process_client_socket(
                         db.expire.remove_entry(key);
                     }
                 }
-                sender
-                    .lock()
-                    .await
-                    .send(RespCommand::Simple("OK").into())
-                    .await?;
+                if RESPONSE {
+                    sender
+                        .lock()
+                        .await
+                        .send(RespCommand::Simple("OK").into())
+                        .await?;
+                }
             }
             ReqCommand::Config(ConfigSubCommand::GET(key)) => {
                 info!("received command CONFIG GET with key: {}", key);
