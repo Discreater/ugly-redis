@@ -82,7 +82,7 @@ async fn main() -> anyhow::Result<()> {
             let socket = handshake_with_master(replicaof, config.clone())
                 .await
                 .expect("handshake with master");
-            process_client_socket::<true>(socket, db, config, state)
+            process_client_socket::<false>(socket, db, config, state)
                 .await
                 .expect("process socket erorr");
         });
@@ -95,7 +95,7 @@ async fn main() -> anyhow::Result<()> {
         let state = state.clone();
         tokio::spawn(async move {
             let socket = tokio_util::codec::Framed::new(socket, MessageFramer);
-            process_client_socket::<false>(socket, db, config, state)
+            process_client_socket::<true>(socket, db, config, state)
                 .await
                 .expect("process socket error")
         });
@@ -180,7 +180,7 @@ async fn handshake_with_master(
         .context("connection closed by master")??
         .parse_resp()?;
     trace!("response of handshake: {:?}", response);
-    debug_assert!(matches!(response, RespCommand::RdbFile(_)));
+    assert!(matches!(response, RespCommand::RdbFile(_)));
     Ok(master)
 }
 
