@@ -4,19 +4,19 @@ use hex_literal::hex;
 use redis_starter_rust::{
     db::Db,
     rdb,
-    resp::{ConfigSubCommand, Master, ReplconfSubcommand, ReqCommand, RespCommand, Slave},
+    resp::{ConfigSubCommand, MessageFramer, ReplconfSubcommand, ReqCommand, RespCommand},
 };
 use std::{
     collections::HashMap,
-    io,
     net::{Ipv4Addr, SocketAddrV4},
     sync::Arc,
     time::{Duration, UNIX_EPOCH},
 };
 use tokio::{
     net::{TcpListener, TcpStream},
-    sync::RwLock,
+    sync::{broadcast, Mutex, RwLock},
 };
+use tokio_util::codec;
 use tracing::{error, info, trace, Level};
 
 use clap::Parser;
@@ -73,90 +73,149 @@ async fn main() -> anyhow::Result<()> {
     let db = Arc::new(RwLock::new(db));
     let config = Arc::new(args);
 
-    if let Some(replicaof) = &config.replicaof {
-        let master = TcpStream::connect(replicaof)
-            .await
-            .context("cannot connect to master")?;
-        let mut master = tokio_util::codec::Framed::new(master, Master);
-        master.send(ReqCommand::Ping).await?;
-        let response = master
-            .next()
-            .await
-            .context("connection closed by master")?
-            .context("decode response message error")?;
-        debug_assert!(matches!(response, RespCommand::Pong));
-        master
-            .send(ReqCommand::Replconf(ReplconfSubcommand::ListeningPort(
-                config.port,
-            )))
-            .await?;
-        let response = master
-            .next()
-            .await
-            .context("connection closed by master")??;
-        debug_assert!(matches!(response, RespCommand::Ok));
-        master
-            .send(ReqCommand::Replconf(ReplconfSubcommand::Capa(
-                "psync2".to_string(),
-            )))
-            .await?;
-        let response = master
-            .next()
-            .await
-            .context("connection closed by master")??;
-        debug_assert!(matches!(response, RespCommand::Ok));
-
-        master
-            .send(ReqCommand::Psync {
-                id: None,
-                offset: None,
-            })
-            .await?;
-        let response = master
-            .next()
-            .await
-            .context("connection closed by master")??;
-        debug_assert!(matches!(response, RespCommand::FullResync { .. }));
+    let state = Arc::new(State::default());
+    if let Some(replicaof) = config.replicaof.clone() {
+        let db = db.clone();
+        let config = config.clone();
+        let state = state.clone();
+        tokio::spawn(async move {
+            let socket = handshake_with_master(replicaof, config.clone())
+                .await
+                .expect("handshake with master");
+            process_client_socket(socket, db, config, state)
+                .await
+                .expect("process socket erorr");
+        });
     }
 
     loop {
         let (socket, _) = listener.accept().await?;
         let db = db.clone();
         let config = config.clone();
+        let state = state.clone();
         tokio::spawn(async move {
-            process_socket(socket, db, config)
+            let socket = tokio_util::codec::Framed::new(socket, MessageFramer);
+            process_client_socket(socket, db, config, state)
                 .await
                 .expect("process socket error")
         });
     }
 }
 
-async fn process_socket(socket: TcpStream, db: Arc<RwLock<Db>>, cfg: Arc<Args>) -> io::Result<()> {
-    let mut socket = tokio_util::codec::Framed::new(socket, Slave);
+const BROADCAST_CAPACITY: usize = 64;
 
-    loop {
-        let message = match socket.next().await {
-            None => {
-                trace!("connection closed");
-                return Ok(());
+#[derive(Debug)]
+struct State {
+    tx: broadcast::Sender<ReqCommand>,
+}
+
+impl Default for State {
+    fn default() -> Self {
+        Self {
+            tx: broadcast::Sender::new(BROADCAST_CAPACITY),
+        }
+    }
+}
+
+async fn handshake_with_master(
+    replicaof: SocketAddrV4,
+    config: Arc<Args>,
+) -> anyhow::Result<codec::Framed<TcpStream, MessageFramer>> {
+    let master = TcpStream::connect(replicaof)
+        .await
+        .context("cannot connect to master")?;
+    let mut master = tokio_util::codec::Framed::new(master, MessageFramer);
+    master.send(ReqCommand::Ping.into()).await?;
+    let response = master
+        .next()
+        .await
+        .context("connection closed by master")?
+        .context("decode response message error")?
+        .parse_resp()?;
+    trace!("response of ping: {:?}", response);
+    debug_assert!(matches!(response, RespCommand::Pong));
+
+    master
+        .send(ReqCommand::Replconf(ReplconfSubcommand::ListeningPort(config.port)).into())
+        .await?;
+    let response = master
+        .next()
+        .await
+        .context("connection closed by master")??
+        .parse_resp()?;
+    trace!("response of replconf: {:?}", response);
+    debug_assert!(matches!(response, RespCommand::Ok));
+
+    master
+        .send(ReqCommand::Replconf(ReplconfSubcommand::Capa("psync2".to_string())).into())
+        .await?;
+    let response = master
+        .next()
+        .await
+        .context("connection closed by master")??
+        .parse_resp()?;
+    trace!("response of replconf: {:?}", response);
+    debug_assert!(matches!(response, RespCommand::Ok));
+
+    master
+        .send(
+            ReqCommand::Psync {
+                id: None,
+                offset: None,
             }
-            Some(message) => message?,
-        };
+            .into(),
+        )
+        .await?;
+    let response = master
+        .next()
+        .await
+        .context("connection closed by master")??
+        .parse_resp()?;
+    trace!("response of psync: {:?}", response);
+    debug_assert!(matches!(response, RespCommand::FullResync { .. }));
 
-        match message {
+    let response = master
+        .next()
+        .await
+        .context("connection closed by master")??
+        .parse_resp()?;
+    trace!("response of handshake: {:?}", response);
+    debug_assert!(matches!(response, RespCommand::RdbFile(_)));
+    Ok(master)
+}
+
+async fn process_client_socket(
+    socket: codec::Framed<TcpStream, MessageFramer>,
+    db: Arc<RwLock<Db>>,
+    cfg: Arc<Args>,
+    state: Arc<State>,
+) -> anyhow::Result<()> {
+    let (sender, mut receiver) = socket.split();
+
+    let sender = Arc::new(Mutex::new(sender));
+
+    let mut replica_task = None;
+    while let Some(message) = receiver.next().await {
+        trace!("received message: {:?}", message);
+        let message = message?.parse_req()?;
+        match &message {
             ReqCommand::Ping => {
                 info!("received command PING");
-                socket.send(RespCommand::Pong).await?;
+                sender.lock().await.send(RespCommand::Pong.into()).await?;
             }
             ReqCommand::Echo(data) => {
                 info!("received command ECHO with data: {}", data);
-                socket.send(RespCommand::Bulk(data)).await?;
+                sender
+                    .lock()
+                    .await
+                    .send(RespCommand::Bulk(data.clone()).into())
+                    .await?;
             }
             ReqCommand::Get(key) => {
                 info!("received command GET with key: {}", key);
                 let (value, expire) = {
                     let db = db.read().await;
-                    (db.kv.get(&key).cloned(), db.expire.get(&key).cloned())
+                    (db.kv.get(key).cloned(), db.expire.get(key).cloned())
                 };
                 let value = if let Some(value) = value {
                     if let Some(expire) = expire {
@@ -172,13 +231,19 @@ async fn process_socket(socket: TcpStream, db: Arc<RwLock<Db>>, cfg: Arc<Args>) 
                 } else {
                     RespCommand::Nil
                 };
-                socket.send(value).await?;
+                sender.lock().await.send(value.into()).await?;
             }
             ReqCommand::Set { key, value, px } => {
                 info!(
                     "received command SET with key: {} and value: {}, px: {:?}",
                     key, value, px
                 );
+                if state.tx.receiver_count() != 0 {
+                    state
+                        .tx
+                        .send(message.clone())
+                        .context("send message to replica error")?;
+                }
                 let expired_time = px.and_then(|px| {
                     (std::time::SystemTime::now() + px)
                         .duration_since(UNIX_EPOCH)
@@ -187,15 +252,19 @@ async fn process_socket(socket: TcpStream, db: Arc<RwLock<Db>>, cfg: Arc<Args>) 
                 });
                 {
                     let mut db = db.write().await;
-                    db.kv.insert(key.clone(), value);
+                    db.kv.insert(key.clone(), value.clone());
 
                     if let Some(expired_time) = expired_time {
                         db.expire.insert(key.clone(), expired_time);
                     } else {
-                        db.expire.remove_entry(&key);
+                        db.expire.remove_entry(key);
                     }
                 }
-                socket.send(RespCommand::Simple("OK")).await?;
+                sender
+                    .lock()
+                    .await
+                    .send(RespCommand::Simple("OK").into())
+                    .await?;
             }
             ReqCommand::Config(ConfigSubCommand::GET(key)) => {
                 info!("received command CONFIG GET with key: {}", key);
@@ -204,8 +273,10 @@ async fn process_socket(socket: TcpStream, db: Arc<RwLock<Db>>, cfg: Arc<Args>) 
                     "dbfilename" => cfg.dbfilename.clone(),
                     _ => None,
                 };
-                socket
-                    .send(RespCommand::Bulks(vec![Some(key), value]))
+                sender
+                    .lock()
+                    .await
+                    .send(RespCommand::Bulks(vec![Some(key.clone()), value]).into())
                     .await?;
             }
             ReqCommand::KEYS(pattern) => {
@@ -219,7 +290,11 @@ async fn process_socket(socket: TcpStream, db: Arc<RwLock<Db>>, cfg: Arc<Args>) 
                     .filter(|key| simple_pattern_match(&pattern, key))
                     .map(Option::Some)
                     .collect();
-                socket.send(RespCommand::Bulks(keys)).await?;
+                sender
+                    .lock()
+                    .await
+                    .send(RespCommand::Bulks(keys).into())
+                    .await?;
             }
             ReqCommand::Info(section) => {
                 info!("received command INFO with section: {:?}", section);
@@ -230,7 +305,11 @@ async fn process_socket(socket: TcpStream, db: Arc<RwLock<Db>>, cfg: Arc<Args>) 
                             .map(|(k, v)| format!("{}:{}", k, v))
                             .collect::<Vec<String>>()
                             .join("\r\n");
-                        socket.send(RespCommand::Bulk(info)).await?;
+                        sender
+                            .lock()
+                            .await
+                            .send(RespCommand::Bulk(info).into())
+                            .await?;
                     }
                     None => {
                         let info = all_info(&cfg)
@@ -238,7 +317,11 @@ async fn process_socket(socket: TcpStream, db: Arc<RwLock<Db>>, cfg: Arc<Args>) 
                             .map(|(k, v)| format!("{}:{}", k, v))
                             .collect::<Vec<String>>()
                             .join("\r\n");
-                        socket.send(RespCommand::Bulk(info)).await?;
+                        sender
+                            .lock()
+                            .await
+                            .send(RespCommand::Bulk(info).into())
+                            .await?;
                     }
                     s => {
                         error!("unsupported INFO section: {:?}", s);
@@ -247,25 +330,50 @@ async fn process_socket(socket: TcpStream, db: Arc<RwLock<Db>>, cfg: Arc<Args>) 
             }
             ReqCommand::Replconf(subc) => {
                 info!("recieved command REPLCONF: {:?}", subc);
-                socket.send(RespCommand::Ok).await?;
+                sender.lock().await.send(RespCommand::Ok.into()).await?;
             }
             ReqCommand::Psync { id, offset } => {
                 info!("recieved command PSYNC, id: {:?}, offset: {:?}", id, offset);
-                socket
-                    .send(RespCommand::FullResync {
-                        repl_id: REPLICATION_ID.to_string(),
-                        offset: 0,
-                    })
+                sender
+                    .lock()
+                    .await
+                    .send(
+                        RespCommand::FullResync {
+                            repl_id: REPLICATION_ID.to_string(),
+                            offset: 0,
+                        }
+                        .into(),
+                    )
                     .await?;
-                socket
-                    .send(RespCommand::RdbFile(EMPTY_RDB_CONTENT.to_vec()))
+                sender
+                    .lock()
+                    .await
+                    .send(RespCommand::RdbFile(EMPTY_RDB_CONTENT.to_vec()).into())
                     .await?;
+
+                if replica_task.is_none() {
+                    let sender_in_replica = Arc::clone(&sender);
+                    let state_in_recv = Arc::clone(&state);
+                    replica_task = Some(tokio::spawn(async move {
+                        let sender = sender_in_replica;
+                        let state = state_in_recv;
+                        let mut receiver = state.tx.subscribe();
+                        while let Ok(message) = receiver.recv().await {
+                            trace!("send message to replica: {:?}", message);
+                            sender.lock().await.send(message.into()).await.unwrap();
+                        }
+                    }));
+                }
             }
             cmd => {
                 error!("unsupported command: {:?}", cmd);
             }
         }
     }
+    if let Some(replic_task) = replica_task {
+        replic_task.abort();
+    }
+    Ok(())
 }
 
 fn replication_info(cfg: &Args) -> HashMap<String, String> {

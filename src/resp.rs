@@ -8,7 +8,7 @@ const CRLF: &'static [u8] = b"\r\n";
 type ReplId = String;
 type ReplOffset = usize;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 #[non_exhaustive]
 pub enum ReqCommand {
     Ping,
@@ -29,13 +29,13 @@ pub enum ReqCommand {
     },
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum ReplconfSubcommand {
     ListeningPort(u16),
     Capa(String),
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 #[non_exhaustive]
 pub enum RespCommand {
     Pong,
@@ -48,7 +48,7 @@ pub enum RespCommand {
     Simple(&'static str),
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 #[non_exhaustive]
 pub enum ConfigSubCommand {
     GET(String),
@@ -69,8 +69,8 @@ impl ReqCommand {
         let message = messages
             .next()
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "empty messages"))?;
-        match message {
-            Message::BulkStrings(Some(data)) => match data.to_uppercase().as_str() {
+        match message.get_string() {
+            Ok(data) => match data.to_uppercase().as_str() {
                 "PING" => Ok(ReqCommand::Ping),
                 "ECHO" => {
                     let message = messages.next().ok_or_else(|| {
@@ -257,7 +257,7 @@ impl ReqCommand {
                     format!("unsupported command: {}", data),
                 )),
             },
-            _ => Err(io::Error::new(
+            Err(message) => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("unsupported message: {:?}", message),
             )),
@@ -274,33 +274,28 @@ impl RespCommand {
                     Ok(RespCommand::Pong)
                 } else if upper_s == "OK" {
                     Ok(RespCommand::Ok)
-                } else {
-                    if upper_s.starts_with("FULLRESYNC") {
-                        let splitted: Vec<&str> = upper_s.split(' ').collect();
-                        if splitted.len() != 3 {
-                            return Err(io::Error::new(
-                                io::ErrorKind::InvalidData,
-                                format!("invalid fullresync message: {:?}", s),
-                            ));
-                        }
-                        let id = splitted[1].to_string();
-                        let offset = splitted[2].parse().map_err(|e| {
-                            io::Error::new(
-                                io::ErrorKind::InvalidData,
-                                format!("invalid offset: {}", e),
-                            )
-                        })?;
-
-                        Ok(RespCommand::FullResync {
-                            repl_id: id,
-                            offset,
-                        })
-                    } else {
-                        Err(io::Error::new(
+                } else if upper_s.starts_with("FULLRESYNC") {
+                    let splitted: Vec<&str> = upper_s.split(' ').collect();
+                    if splitted.len() != 3 {
+                        return Err(io::Error::new(
                             io::ErrorKind::InvalidData,
-                            format!("unsupported simple string message: {:?}", s),
-                        ))
+                            format!("invalid fullresync message: {:?}", s),
+                        ));
                     }
+                    let id = splitted[1].to_string();
+                    let offset = splitted[2].parse().map_err(|e| {
+                        io::Error::new(io::ErrorKind::InvalidData, format!("invalid offset: {}", e))
+                    })?;
+
+                    Ok(RespCommand::FullResync {
+                        repl_id: id,
+                        offset,
+                    })
+                } else {
+                    Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("unsupported simple string message: {:?}", s),
+                    ))
                 }
             }
             Message::BulkStrings(Some(s)) => Ok(RespCommand::Bulk(s)),
@@ -317,6 +312,7 @@ impl RespCommand {
                 })
                 .collect::<Result<Vec<Option<String>>, io::Error>>()
                 .map(RespCommand::Bulks),
+            Message::Rdb(content) => Ok(RespCommand::RdbFile(content)),
             _ => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("unsupported message: {:?}", message),
@@ -325,9 +321,8 @@ impl RespCommand {
     }
 }
 
-#[allow(dead_code)]
 #[derive(Debug, PartialEq)]
-enum Message {
+pub enum Message {
     // RESP2 	Simple 	+
     SimpleStrings(String),
     // RESP2 	Simple 	-
@@ -358,6 +353,8 @@ enum Message {
     Sets,
     // RESP3 	Aggregate 	>
     Pushes,
+    // bulk strings withouth the trailing CRLF.
+    Rdb(Vec<u8>),
 }
 
 impl Message {
@@ -368,85 +365,68 @@ impl Message {
             _ => return Err(self),
         })
     }
+
+    pub fn parse_resp(self) -> Result<RespCommand, io::Error> {
+        RespCommand::parse(self)
+    }
+
+    pub fn parse_req(self) -> Result<ReqCommand, io::Error> {
+        match self {
+            Message::Arrays(messages) => Ok(ReqCommand::parse(messages)?),
+            message => Err(std::io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!("unsupported top message: {:?}", message),
+            )),
+        }
+    }
 }
 
-pub struct Slave;
+pub struct MessageFramer;
 
-impl Decoder for Slave {
-    type Item = ReqCommand;
+impl Decoder for MessageFramer {
+    type Item = Message;
     type Error = std::io::Error;
 
     fn decode(&mut self, src: &mut bytes::BytesMut) -> Result<Option<Self::Item>, Self::Error> {
         let mut parser = Parser::new(src);
         let message = parser.parse()?;
 
-        if let Some(message) = message {
+        if message.is_some() {
             src.advance(parser.idx);
-            match message {
-                Message::Arrays(messages) => Ok(Some(ReqCommand::parse(messages)?)),
-                message => Err(std::io::Error::new(
-                    io::ErrorKind::Unsupported,
-                    format!("unsupported top message: {:?}", message),
-                )),
-            }
-        } else {
-            Ok(None)
         }
+        Ok(message)
     }
 }
 
-impl Encoder<RespCommand> for Slave {
-    type Error = std::io::Error;
-
-    fn encode(&mut self, item: RespCommand, dst: &mut bytes::BytesMut) -> Result<(), Self::Error> {
-        match item {
-            RespCommand::Pong => Message::SimpleStrings("PONG".to_string()).encode_to(dst),
-            RespCommand::Ok => Message::SimpleStrings("OK".to_string()).encode_to(dst),
-            RespCommand::Bulk(s) => Message::BulkStrings(Some(s)).encode_to(dst),
+impl From<RespCommand> for Message {
+    fn from(value: RespCommand) -> Self {
+        match value {
+            RespCommand::Pong => Message::SimpleStrings("PONG".to_string()),
+            RespCommand::Ok => Message::SimpleStrings("OK".to_string()),
+            RespCommand::Bulk(s) => Message::BulkStrings(Some(s)),
             RespCommand::Bulks(v) => {
-                Message::Arrays(v.into_iter().map(Message::BulkStrings).collect()).encode_to(dst)
+                Message::Arrays(v.into_iter().map(Message::BulkStrings).collect())
             }
-            RespCommand::Simple(s) => Message::SimpleStrings(s.to_string()).encode_to(dst),
-            RespCommand::Nil => Message::BulkStrings(None).encode_to(dst),
+            RespCommand::Simple(s) => Message::SimpleStrings(s.to_string()),
+            RespCommand::Nil => Message::BulkStrings(None),
             RespCommand::FullResync { repl_id, offset } => {
-                Message::SimpleStrings(format!("FULLRESYNC {} {}", repl_id, offset)).encode_to(dst)
+                Message::SimpleStrings(format!("FULLRESYNC {} {}", repl_id, offset))
             }
-            RespCommand::RdbFile(content) => {
-                // bulk strings withouth the trailing CRLF.
-                dst.extend_from_slice(b"$");
-                dst.extend_from_slice(content.len().to_string().as_bytes());
-                dst.extend_from_slice(CRLF);
-                dst.extend_from_slice(&content);
-                Ok(())
-            }
+            RespCommand::RdbFile(content) => Message::Rdb(content),
         }
     }
 }
-
-pub struct Master;
-
-impl Decoder for Master {
-    type Item = RespCommand;
-
+impl Encoder<Message> for MessageFramer {
     type Error = std::io::Error;
 
-    fn decode(&mut self, src: &mut bytes::BytesMut) -> Result<Option<Self::Item>, Self::Error> {
-        let mut parser = Parser::new(src);
-        let message = parser.parse()?;
-        if let Some(message) = message {
-            src.advance(parser.idx);
-            Ok(Some(RespCommand::parse(message)?))
-        } else {
-            Ok(None)
-        }
+    fn encode(&mut self, item: Message, dst: &mut bytes::BytesMut) -> Result<(), Self::Error> {
+        item.encode_to(dst)
     }
 }
 
-impl Encoder<ReqCommand> for Master {
-    type Error = std::io::Error;
-
-    fn encode(&mut self, item: ReqCommand, dst: &mut bytes::BytesMut) -> Result<(), Self::Error> {
-        match item {
+impl From<ReqCommand> for Message {
+    fn from(value: ReqCommand) -> Self {
+        match value {
             ReqCommand::Ping => Message::Arrays(vec![Message::SimpleStrings("PING".to_string())]),
             ReqCommand::Config(cfg) => match cfg {
                 ConfigSubCommand::GET(key) => Message::Arrays(vec![
@@ -523,7 +503,6 @@ impl Encoder<ReqCommand> for Master {
                 ])
             }
         }
-        .encode_to(dst)
     }
 }
 
@@ -555,6 +534,13 @@ impl Message {
                 dst.extend_from_slice(b"+");
                 dst.extend_from_slice(data.as_bytes());
                 dst.extend_from_slice(CRLF);
+            }
+            Message::Rdb(content) => {
+                // bulk strings withouth the trailing CRLF.
+                dst.extend_from_slice(b"$");
+                dst.extend_from_slice(content.len().to_string().as_bytes());
+                dst.extend_from_slice(CRLF);
+                dst.extend_from_slice(&content);
             }
             _ => {
                 error!("unsupported message: {:?}", self);
@@ -602,16 +588,20 @@ impl Parser<'_> {
             b'$' => {
                 let len = self.consume_nullable_decimal_line()?;
                 if let Some(len) = len {
-                    if self.remain().len() < len + 2 {
+                    if self.remain().len() < len {
                         return Ok(None);
                     }
-                    let data = self.advance_unchecked(len);
-                    let data = String::from_utf8(data.to_vec()).map_err(|_| {
-                        io::Error::new(io::ErrorKind::InvalidData, "invalid utf8 string")
-                    })?;
+                    let data = self.advance_unchecked(len).to_vec();
+
                     if self.remain().starts_with(CRLF) {
+                        let data = String::from_utf8(data).map_err(|_| {
+                            io::Error::new(io::ErrorKind::InvalidData, "invalid utf8 string")
+                        })?;
                         self.idx += 2;
                         return Ok(Some(Message::BulkStrings(Some(data))));
+                    } else if self.remain().is_empty() {
+                        trace!("rdb file");
+                        return Ok(Some(Message::Rdb(data)));
                     } else {
                         return Err(io::Error::new(io::ErrorKind::InvalidData, "expected CRLF"));
                     }
