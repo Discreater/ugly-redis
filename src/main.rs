@@ -2,9 +2,10 @@ use anyhow::Context;
 use futures_util::{SinkExt, StreamExt};
 use hex_literal::hex;
 use redis_starter_rust::{
+    command::{ConfigSubCommand, ReplConfSubresponse, ReplconfSubcommand, ReqCommand, RespCommand},
     db::Db,
+    message::MessageFramer,
     rdb,
-    resp::{ConfigSubCommand, MessageFramer, ReplconfSubcommand, ReqCommand, RespCommand},
 };
 use std::{
     collections::HashMap,
@@ -17,7 +18,7 @@ use tokio::{
     sync::{broadcast, Mutex, RwLock},
 };
 use tokio_util::codec;
-use tracing::{error, info, trace, Level};
+use tracing::{error, info, trace, warn, Level};
 
 use clap::Parser;
 
@@ -184,7 +185,7 @@ async fn handshake_with_master(
     Ok(master)
 }
 
-async fn process_client_socket<const RESPONSE: bool>(
+async fn process_client_socket<const CLIENT: bool>(
     socket: codec::Framed<TcpStream, MessageFramer>,
     db: Arc<RwLock<Db>>,
     cfg: Arc<Args>,
@@ -197,19 +198,24 @@ async fn process_client_socket<const RESPONSE: bool>(
     let mut replica_task = None;
     while let Some(message) = receiver.next().await {
         trace!("received message: {:?}", message);
-        let message = message?.parse_req()?;
-        match &message {
+        let message = message?;
+        let req_command = message.parse_req()?;
+        match &req_command {
             ReqCommand::Ping => {
                 info!("received command PING");
-                sender.lock().await.send(RespCommand::Pong.into()).await?;
+                if CLIENT {
+                    sender.lock().await.send(RespCommand::Pong.into()).await?;
+                }
             }
             ReqCommand::Echo(data) => {
                 info!("received command ECHO with data: {}", data);
-                sender
-                    .lock()
-                    .await
-                    .send(RespCommand::Bulk(data.clone()).into())
-                    .await?;
+                if CLIENT {
+                    sender
+                        .lock()
+                        .await
+                        .send(RespCommand::Bulk(data.clone()).into())
+                        .await?;
+                }
             }
             ReqCommand::Get(key) => {
                 info!("received command GET with key: {}", key);
@@ -231,7 +237,9 @@ async fn process_client_socket<const RESPONSE: bool>(
                 } else {
                     RespCommand::Nil
                 };
-                sender.lock().await.send(value.into()).await?;
+                if CLIENT {
+                    sender.lock().await.send(value.into()).await?;
+                }
             }
             ReqCommand::Set { key, value, px } => {
                 info!(
@@ -241,7 +249,7 @@ async fn process_client_socket<const RESPONSE: bool>(
                 if state.tx.receiver_count() != 0 {
                     state
                         .tx
-                        .send(message.clone())
+                        .send(req_command.clone())
                         .context("send message to replica error")?;
                 }
                 let expired_time = px.and_then(|px| {
@@ -260,7 +268,7 @@ async fn process_client_socket<const RESPONSE: bool>(
                         db.expire.remove_entry(key);
                     }
                 }
-                if RESPONSE {
+                if CLIENT {
                     sender
                         .lock()
                         .await
@@ -275,11 +283,13 @@ async fn process_client_socket<const RESPONSE: bool>(
                     "dbfilename" => cfg.dbfilename.clone(),
                     _ => None,
                 };
-                sender
-                    .lock()
-                    .await
-                    .send(RespCommand::Bulks(vec![Some(key.clone()), value]).into())
-                    .await?;
+                if CLIENT {
+                    sender
+                        .lock()
+                        .await
+                        .send(RespCommand::Bulks(vec![Some(key.clone()), value]).into())
+                        .await?;
+                }
             }
             ReqCommand::KEYS(pattern) => {
                 info!("received commadn KEYS with pattern: {}", pattern);
@@ -292,11 +302,13 @@ async fn process_client_socket<const RESPONSE: bool>(
                     .filter(|key| simple_pattern_match(&pattern, key))
                     .map(Option::Some)
                     .collect();
-                sender
-                    .lock()
-                    .await
-                    .send(RespCommand::Bulks(keys).into())
-                    .await?;
+                if CLIENT {
+                    sender
+                        .lock()
+                        .await
+                        .send(RespCommand::Bulks(keys).into())
+                        .await?;
+                }
             }
             ReqCommand::Info(section) => {
                 info!("received command INFO with section: {:?}", section);
@@ -332,7 +344,20 @@ async fn process_client_socket<const RESPONSE: bool>(
             }
             ReqCommand::Replconf(subc) => {
                 info!("recieved command REPLCONF: {:?}", subc);
-                sender.lock().await.send(RespCommand::Ok.into()).await?;
+                if CLIENT {
+                    sender.lock().await.send(RespCommand::Ok.into()).await?;
+                } else {
+                    match subc {
+                        ReplconfSubcommand::Getack => {
+                            sender
+                                .lock()
+                                .await
+                                .send(RespCommand::Replconf(ReplConfSubresponse::Ack(0)).into())
+                                .await?;
+                        }
+                        _ => warn!("only response getack when in replica mode"),
+                    }
+                }
             }
             ReqCommand::Psync { id, offset } => {
                 info!("recieved command PSYNC, id: {:?}, offset: {:?}", id, offset);
