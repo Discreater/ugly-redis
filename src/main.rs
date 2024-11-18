@@ -404,10 +404,12 @@ async fn process_client_socket<const NOT_SLAVE: bool>(
             ReqCommand::Wait { n0, n1 } => {
                 info!("received command WAIT, n0: {}, n1: {}", n0, n1);
                 if NOT_SLAVE {
+                    // replica number is assert to small than i64::max;
+                    let replicas = state.tx.receiver_count() as i64;
                     sender
                         .lock()
                         .await
-                        .send(RespCommand::Int(0).into())
+                        .send(RespCommand::Int(replicas as i64).into())
                         .await?;
                 }
             }
