@@ -95,7 +95,7 @@ async fn main() -> anyhow::Result<()> {
         let config = config.clone();
         let state = state.clone();
         tokio::spawn(async move {
-            let socket = tokio_util::codec::Framed::new(socket, MessageFramer);
+            let socket = tokio_util::codec::Framed::new(socket, MessageFramer::default());
             process_client_socket::<true>(socket, db, config, state)
                 .await
                 .expect("process socket error")
@@ -125,13 +125,14 @@ async fn handshake_with_master(
     let master = TcpStream::connect(replicaof)
         .await
         .context("cannot connect to master")?;
-    let mut master = tokio_util::codec::Framed::new(master, MessageFramer);
+    let mut master = tokio_util::codec::Framed::new(master, MessageFramer::default());
     master.send(ReqCommand::Ping.into()).await?;
     let response = master
         .next()
         .await
         .context("connection closed by master")?
         .context("decode response message error")?
+        .0
         .parse_resp()?;
     trace!("response of ping: {:?}", response);
     debug_assert!(matches!(response, RespCommand::Pong));
@@ -143,6 +144,7 @@ async fn handshake_with_master(
         .next()
         .await
         .context("connection closed by master")??
+        .0
         .parse_resp()?;
     trace!("response of replconf: {:?}", response);
     debug_assert!(matches!(response, RespCommand::Ok));
@@ -154,6 +156,7 @@ async fn handshake_with_master(
         .next()
         .await
         .context("connection closed by master")??
+        .0
         .parse_resp()?;
     trace!("response of replconf: {:?}", response);
     debug_assert!(matches!(response, RespCommand::Ok));
@@ -171,6 +174,7 @@ async fn handshake_with_master(
         .next()
         .await
         .context("connection closed by master")??
+        .0
         .parse_resp()?;
     trace!("response of psync: {:?}", response);
     debug_assert!(matches!(response, RespCommand::FullResync { .. }));
@@ -179,13 +183,14 @@ async fn handshake_with_master(
         .next()
         .await
         .context("connection closed by master")??
+        .0
         .parse_resp()?;
     trace!("response of handshake: {:?}", response);
     assert!(matches!(response, RespCommand::RdbFile(_)));
     Ok(master)
 }
 
-async fn process_client_socket<const CLIENT: bool>(
+async fn process_client_socket<const NOT_SLAVE: bool>(
     socket: codec::Framed<TcpStream, MessageFramer>,
     db: Arc<RwLock<Db>>,
     cfg: Arc<Args>,
@@ -196,20 +201,21 @@ async fn process_client_socket<const CLIENT: bool>(
     let sender = Arc::new(Mutex::new(sender));
 
     let mut replica_task = None;
+    let mut received_bytes = 0;
     while let Some(message) = receiver.next().await {
         trace!("received message: {:?}", message);
-        let message = message?;
+        let (message, message_bytes) = message?;
         let req_command = message.parse_req()?;
         match &req_command {
             ReqCommand::Ping => {
                 info!("received command PING");
-                if CLIENT {
+                if NOT_SLAVE {
                     sender.lock().await.send(RespCommand::Pong.into()).await?;
                 }
             }
             ReqCommand::Echo(data) => {
                 info!("received command ECHO with data: {}", data);
-                if CLIENT {
+                if NOT_SLAVE {
                     sender
                         .lock()
                         .await
@@ -237,7 +243,7 @@ async fn process_client_socket<const CLIENT: bool>(
                 } else {
                     RespCommand::Nil
                 };
-                if CLIENT {
+                if NOT_SLAVE {
                     sender.lock().await.send(value.into()).await?;
                 }
             }
@@ -268,7 +274,7 @@ async fn process_client_socket<const CLIENT: bool>(
                         db.expire.remove_entry(key);
                     }
                 }
-                if CLIENT {
+                if NOT_SLAVE {
                     sender
                         .lock()
                         .await
@@ -283,7 +289,7 @@ async fn process_client_socket<const CLIENT: bool>(
                     "dbfilename" => cfg.dbfilename.clone(),
                     _ => None,
                 };
-                if CLIENT {
+                if NOT_SLAVE {
                     sender
                         .lock()
                         .await
@@ -302,7 +308,7 @@ async fn process_client_socket<const CLIENT: bool>(
                     .filter(|key| simple_pattern_match(&pattern, key))
                     .map(Option::Some)
                     .collect();
-                if CLIENT {
+                if NOT_SLAVE {
                     sender
                         .lock()
                         .await
@@ -344,7 +350,7 @@ async fn process_client_socket<const CLIENT: bool>(
             }
             ReqCommand::Replconf(subc) => {
                 info!("recieved command REPLCONF: {:?}", subc);
-                if CLIENT {
+                if NOT_SLAVE {
                     sender.lock().await.send(RespCommand::Ok.into()).await?;
                 } else {
                     match subc {
@@ -352,7 +358,10 @@ async fn process_client_socket<const CLIENT: bool>(
                             sender
                                 .lock()
                                 .await
-                                .send(RespCommand::Replconf(ReplConfSubresponse::Ack(0)).into())
+                                .send(
+                                    RespCommand::Replconf(ReplConfSubresponse::Ack(received_bytes))
+                                        .into(),
+                                )
                                 .await?;
                         }
                         _ => warn!("only response getack when in replica mode"),
@@ -396,6 +405,7 @@ async fn process_client_socket<const CLIENT: bool>(
                 error!("unsupported command: {:?}", cmd);
             }
         }
+        received_bytes += message_bytes;
     }
     if let Some(replic_task) = replica_task {
         replic_task.abort();

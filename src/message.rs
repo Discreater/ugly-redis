@@ -61,7 +61,6 @@ impl Message {
     }
 
     pub fn parse_resp(self) -> Result<RespCommand, ParseMessageError> {
-        trace!("parsing resp command, message: {:?}", self);
         RespCommand::parse(self)
     }
 
@@ -76,22 +75,24 @@ impl Message {
     }
 }
 
+#[derive(Default, Debug)]
 pub struct MessageFramer;
 
 impl Decoder for MessageFramer {
-    type Item = Message;
+    type Item = (Message, usize);
     type Error = std::io::Error;
 
     fn decode(&mut self, src: &mut bytes::BytesMut) -> Result<Option<Self::Item>, Self::Error> {
         let mut parser = Parser::new(src);
         let message = parser.parse()?;
+        let consumed = parser.idx;
 
         if message.is_some() {
-            src.advance(parser.idx);
+            src.advance(consumed);
         } else {
             trace!("not enough data");
         }
-        Ok(message)
+        Ok(message.map(|m| (m, consumed)))
     }
 }
 
