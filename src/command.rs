@@ -1,4 +1,4 @@
-use std::{time::Duration, vec};
+use std::{num::ParseIntError, time::Duration, vec};
 use thiserror::Error;
 use tracing::error;
 
@@ -26,6 +26,10 @@ pub enum ReqCommand {
         id: Option<ReplId>,
         offset: Option<ReplOffset>,
     },
+    Wait {
+        n0: usize,
+        n1: usize,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -47,6 +51,7 @@ pub enum RespCommand {
     Bulks(Vec<Option<String>>),
     Nil,
     Simple(&'static str),
+    Int(i64),
 }
 
 #[derive(Debug, Clone)]
@@ -73,6 +78,12 @@ pub enum ParseMessageError {
 impl From<Message> for ParseMessageError {
     fn from(message: Message) -> ParseMessageError {
         ParseMessageError::ExpectString(message)
+    }
+}
+
+impl From<ParseIntError> for ParseMessageError {
+    fn from(value: ParseIntError) -> Self {
+        ParseMessageError::Unsupported(value.to_string())
     }
 }
 
@@ -193,16 +204,11 @@ impl ReqCommand {
                                 .ok_or_else(|| {
                                     ParseMessageError::expect("REPLCONF LISTENING-PORT value")
                                 })?
-                                .get_string()?;
-                            match port.parse::<u16>() {
-                                Ok(port) => Ok(ReqCommand::Replconf(
-                                    ReplconfSubcommand::ListeningPort(port),
-                                )),
-                                Err(_) => Err(ParseMessageError::unsupported(format!(
-                                    "invalid REPLCONF LISTENING-PORT value: {}",
-                                    port
-                                ))),
-                            }
+                                .get_string()?
+                                .parse()?;
+                            Ok(ReqCommand::Replconf(ReplconfSubcommand::ListeningPort(
+                                port,
+                            )))
                         }
                         "CAPA" => {
                             let capa = messages
@@ -245,6 +251,19 @@ impl ReqCommand {
                         })?)
                     };
                     Ok(ReqCommand::Psync { id, offset })
+                }
+                "WAIT" => {
+                    let n0 = messages
+                        .next()
+                        .ok_or_else(|| ParseMessageError::expect("WAIT n0"))?
+                        .get_string()?
+                        .parse()?;
+                    let n1 = messages
+                        .next()
+                        .ok_or_else(|| ParseMessageError::expect("WAIT n1"))?
+                        .get_string()?
+                        .parse()?;
+                    Ok(ReqCommand::Wait { n0, n1 })
                 }
                 _ => Err(ParseMessageError::unsupported(format!("command: {}", data))),
             },
@@ -381,6 +400,7 @@ impl From<RespCommand> for Message {
                 }
                 Message::Arrays(messages)
             }
+            RespCommand::Int(v) => Message::Integers(v),
         }
     }
 }
@@ -469,6 +489,11 @@ impl From<ReqCommand> for Message {
                     offset,
                 ])
             }
+            ReqCommand::Wait { n0, n1 } => Message::Arrays(vec![
+                Message::SimpleStrings("WAIT".to_string()),
+                Message::SimpleStrings(n0.to_string()),
+                Message::SimpleStrings(n1.to_string()),
+            ]),
         }
     }
 }

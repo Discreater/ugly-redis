@@ -401,6 +401,16 @@ async fn process_client_socket<const NOT_SLAVE: bool>(
                     }));
                 }
             }
+            ReqCommand::Wait { n0, n1 } => {
+                info!("received command WAIT, n0: {}, n1: {}", n0, n1);
+                if NOT_SLAVE {
+                    sender
+                        .lock()
+                        .await
+                        .send(RespCommand::Int(0).into())
+                        .await?;
+                }
+            }
             cmd => {
                 error!("unsupported command: {:?}", cmd);
             }
