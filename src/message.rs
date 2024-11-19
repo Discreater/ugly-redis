@@ -100,6 +100,7 @@ impl Encoder<Message> for MessageFramer {
     type Error = std::io::Error;
 
     fn encode(&mut self, item: Message, dst: &mut bytes::BytesMut) -> Result<(), Self::Error> {
+        trace!("sending message: {item:?}");
         item.encode_to(dst)
     }
 }
@@ -169,7 +170,6 @@ impl Parser<'_> {
         // The first (and sometimes also the second) bulk string in the array is the command's name.
         // Subsequent elements of the array are the arguments for the command.
         if self.remain().is_empty() {
-            trace!("remain is empty");
             return Ok(None);
         }
         let data_type = self.consume_one_unchecked();

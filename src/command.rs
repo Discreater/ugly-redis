@@ -1,6 +1,6 @@
 use std::{num::ParseIntError, time::Duration, vec};
 use thiserror::Error;
-use tracing::error;
+use tracing::{error, trace};
 
 use crate::message::Message;
 
@@ -27,8 +27,8 @@ pub enum ReqCommand {
         offset: Option<ReplOffset>,
     },
     Wait {
-        n0: usize,
-        n1: usize,
+        number_replicas: usize,
+        time_out: usize,
     },
 }
 
@@ -253,17 +253,20 @@ impl ReqCommand {
                     Ok(ReqCommand::Psync { id, offset })
                 }
                 "WAIT" => {
-                    let n0 = messages
+                    let number_replicas = messages
                         .next()
-                        .ok_or_else(|| ParseMessageError::expect("WAIT n0"))?
+                        .ok_or_else(|| ParseMessageError::expect("WAIT number_replicas"))?
                         .get_string()?
                         .parse()?;
-                    let n1 = messages
+                    let timeout = messages
                         .next()
-                        .ok_or_else(|| ParseMessageError::expect("WAIT n1"))?
+                        .ok_or_else(|| ParseMessageError::expect("WAIT timeout"))?
                         .get_string()?
                         .parse()?;
-                    Ok(ReqCommand::Wait { n0, n1 })
+                    Ok(ReqCommand::Wait {
+                        number_replicas,
+                        time_out: timeout,
+                    })
                 }
                 _ => Err(ParseMessageError::unsupported(format!("command: {}", data))),
             },
@@ -377,6 +380,7 @@ impl RespCommand {
 
 impl From<RespCommand> for Message {
     fn from(value: RespCommand) -> Self {
+        trace!("Convert RespCommand to Message: {:?}", value);
         match value {
             RespCommand::Pong => Message::SimpleStrings("PONG".to_string()),
             RespCommand::Ok => Message::SimpleStrings("OK".to_string()),
@@ -489,10 +493,13 @@ impl From<ReqCommand> for Message {
                     offset,
                 ])
             }
-            ReqCommand::Wait { n0, n1 } => Message::Arrays(vec![
+            ReqCommand::Wait {
+                number_replicas,
+                time_out,
+            } => Message::Arrays(vec![
                 Message::SimpleStrings("WAIT".to_string()),
-                Message::SimpleStrings(n0.to_string()),
-                Message::SimpleStrings(n1.to_string()),
+                Message::SimpleStrings(number_replicas.to_string()),
+                Message::SimpleStrings(time_out.to_string()),
             ]),
         }
     }
