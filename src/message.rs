@@ -73,6 +73,13 @@ impl Message {
             ))),
         }
     }
+
+    /// Slow, may be fixed
+    pub fn count_bytes(&self) -> Result<usize, io::Error> {
+        let mut buffer = bytes::BytesMut::new();
+        self.encode_to(&mut buffer)?;
+        Ok(buffer.len())
+    }
 }
 
 #[derive(Default, Debug)]
@@ -100,13 +107,12 @@ impl Encoder<Message> for MessageFramer {
     type Error = std::io::Error;
 
     fn encode(&mut self, item: Message, dst: &mut bytes::BytesMut) -> Result<(), Self::Error> {
-        trace!("sending message: {item:?}");
         item.encode_to(dst)
     }
 }
 
 impl Message {
-    fn encode_to(self, dst: &mut bytes::BytesMut) -> Result<(), io::Error> {
+    fn encode_to(&self, dst: &mut bytes::BytesMut) -> Result<(), io::Error> {
         match self {
             Message::Arrays(messages) => {
                 dst.extend_from_slice(b"*");

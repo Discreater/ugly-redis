@@ -1,4 +1,4 @@
-use anyhow::Context;
+use anyhow::{bail, Context};
 use futures_util::{SinkExt, StreamExt};
 use hex_literal::hex;
 use redis_starter_rust::{
@@ -6,16 +6,17 @@ use redis_starter_rust::{
     db::Db,
     message::MessageFramer,
     rdb,
-    replica::ReplicaManager,
+    replica::{ReplicaManager, ReplicaNotifyMessage},
 };
 use std::{
     collections::HashMap,
-    net::{Ipv4Addr, SocketAddr, SocketAddrV4},
+    net::{Ipv4Addr, SocketAddrV4},
     sync::Arc,
     time::{Duration, UNIX_EPOCH},
 };
 use tokio::{
     net::{TcpListener, TcpStream},
+    select,
     sync::RwLock,
 };
 use tokio_util::codec;
@@ -62,7 +63,7 @@ async fn main() -> anyhow::Result<()> {
     let log_level = if std::env::var("REDIS_LOG").is_ok() {
         Level::TRACE
     } else {
-        Level::TRACE
+        Level::WARN
     };
     tracing_subscriber::fmt().with_max_level(log_level).init();
     let args = Args::parse();
@@ -187,8 +188,6 @@ async fn process_client_socket<const NOT_SLAVE: bool>(
     cfg: Arc<Args>,
     replica_manager: Arc<ReplicaManager>,
 ) -> anyhow::Result<()> {
-    let addr = socket.get_ref().peer_addr()?;
-
     let mut received_bytes = 0;
     while let Some(message) = socket.next().await {
         trace!("received message: {:?}", message);
@@ -232,6 +231,7 @@ async fn process_client_socket<const NOT_SLAVE: bool>(
             ReqCommand::Set { key, value, px } => {
                 replica_manager
                     .notify(req_command.clone())
+                    .await
                     .context("notify message to replica error")?;
                 let expired_time = px.and_then(|px| {
                     (std::time::SystemTime::now() + px)
@@ -331,7 +331,7 @@ async fn process_client_socket<const NOT_SLAVE: bool>(
                     .send(RespCommand::RdbFile(EMPTY_RDB_CONTENT.to_vec()).into())
                     .await?;
 
-                return process_replica_socket(socket, replica_manager, &addr).await;
+                return process_replica_socket(socket, replica_manager).await;
             }
             ReqCommand::Wait {
                 number_replicas,
@@ -339,8 +339,7 @@ async fn process_client_socket<const NOT_SLAVE: bool>(
             } => {
                 if NOT_SLAVE {
                     // replica number is assert to small than i64::max;
-                    let replicas = replica_manager.wait(*number_replicas, *time_out).await;
-                    let replicas = replicas.min(*number_replicas);
+                    let replicas = replica_manager.wait(*number_replicas, *time_out).await?;
                     socket
                         .send(RespCommand::Int(replicas as i64).into())
                         .await?;
@@ -356,27 +355,45 @@ async fn process_client_socket<const NOT_SLAVE: bool>(
 }
 
 async fn process_replica_socket(
-    mut socket: codec::Framed<TcpStream, MessageFramer>,
+    socket: codec::Framed<TcpStream, MessageFramer>,
     manager: Arc<ReplicaManager>,
-    addr: &SocketAddr,
 ) -> anyhow::Result<()> {
     info!("replica connected.");
-    let mut receiver = manager.subscribe(&addr);
-    while let Ok(message) = receiver.recv().await {
-        trace!("send message to replica: {:?}", message);
-        socket.send(message.into()).await?;
-        socket
-            .send(ReqCommand::Replconf(ReplconfSubcommand::Getack).into())
-            .await?;
-        // TODO ack will received may two thousand years ago, so we need to split the ack and the propgate message to replica.
-        let _ack = socket
-            .next()
-            .await
-            .context("connection closed by remote")??;
-        receiver.sent().await;
+    let (mut socket_tx, mut socket_rx) = socket.split();
+    let mut replica_broadcast_rx = manager.subscribe();
+
+    loop {
+        select! {
+            message = replica_broadcast_rx.recv() => {
+                let propagated = message?;
+                trace!("replica received broadcast message: {:?}", propagated);
+                match propagated {
+                    ReplicaNotifyMessage::Propagated(propagated) => {
+                        socket_tx.send(propagated).await?;
+                    }
+                    ReplicaNotifyMessage::Wait => {
+                        socket_tx
+                        .send(ReqCommand::Replconf(ReplconfSubcommand::Getack).into())
+                        .await?;
+                    }
+                }
+            }
+            message = socket_rx.next() => {
+                trace!("received message: {:?}", message);
+                let (message, _) = message.context("connection closed by remote")??;
+                let resp_command = message.parse_resp()?;
+                info!("parsed command: {resp_command:?}");
+                match &resp_command {
+                    RespCommand::Replconf(ReplConfSubresponse::Ack(n)) => {
+                        manager.ack(*n).await;
+                    }
+                    resp => {
+                        bail!("unaccpet response in replica: {resp:?}")
+                    }
+                }
+            }
+        }
     }
-    info!("replica exited.");
-    Ok(())
 }
 
 fn replication_info(cfg: &Args) -> HashMap<String, String> {
