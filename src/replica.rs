@@ -72,7 +72,7 @@ impl ReplicaManager {
         let need_acked = { *self.replica_need_acked.lock().await };
         if need_acked == 0 {
             // nothing to sync, every replica is finished
-            return Ok(n.min(self.replicas()));
+            return Ok(self.replicas());
         }
         self.replica_notify_tx.send(ReplicaNotifyMessage::Wait)?;
         match tokio::time::timeout(
