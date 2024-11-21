@@ -3,7 +3,7 @@ use futures_util::{SinkExt, StreamExt};
 use hex_literal::hex;
 use redis_starter_rust::{
     command::{ConfigSubCommand, ReplConfSubresponse, ReplconfSubcommand, ReqCommand, RespCommand},
-    db::{Db, Value},
+    db::{Db, StreamEntry, Value},
     message::MessageFramer,
     rdb,
     replica::{ReplicaManager, ReplicaNotifyMessage},
@@ -352,6 +352,35 @@ async fn process_client_socket<const NOT_SLAVE: bool>(
                         Value::ty(db.kv.get(key))
                     };
                     socket.send(RespCommand::Simple(ty).into()).await?
+                }
+            }
+            ReqCommand::XADD {
+                stream_key,
+                entry_id,
+                pairs,
+            } => {
+                if NOT_SLAVE {
+                    if let Some(entry_id) = entry_id {
+                        {
+                            let mut db = db.write().await;
+                            let entry = db
+                                .kv
+                                .entry(stream_key.clone())
+                                .or_insert_with(|| Value::Stream(vec![]));
+                            match entry {
+                                Value::Stream(stream) => {
+                                    stream.push(StreamEntry {
+                                        id: entry_id.to_string(),
+                                        pairs: pairs.clone(),
+                                    });
+                                }
+                                _ => bail!("value of key '{stream_key}' is not a stream!")
+                            }
+                        }
+                        socket
+                            .send(RespCommand::Bulk(entry_id.to_string()).into())
+                            .await?
+                    }
                 }
             }
             cmd => {

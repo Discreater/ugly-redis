@@ -16,7 +16,13 @@ pub enum Value {
     Set,
     ZSet,
     Hash,
-    Stream,
+    Stream(Vec<StreamEntry>),
+}
+
+#[derive(Clone, Debug)]
+pub struct StreamEntry {
+    pub id: String,
+    pub pairs: Vec<(String, String)>,
 }
 
 impl Value {
@@ -27,7 +33,7 @@ impl Value {
             Some(Value::Set) => "set",
             Some(Value::ZSet) => "zset",
             Some(Value::Hash) => "hash",
-            Some(Value::Stream) => "stream",
+            Some(Value::Stream(_)) => "stream",
             None => "none",
         }
     }

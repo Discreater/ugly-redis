@@ -31,6 +31,11 @@ pub enum ReqCommand {
         time_out: usize,
     },
     Type(String),
+    XADD {
+        stream_key: String,
+        entry_id: Option<String>,
+        pairs: Vec<(String, String)>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -285,6 +290,35 @@ impl ReqCommand {
                         .get_string()?;
                     Ok(ReqCommand::Type(key))
                 }
+                "XADD" => {
+                    let stream_key = messages
+                        .next()
+                        .ok_or_else(|| ParseMessageError::expect("XADD stream key"))?
+                        .get_string()?;
+                    let entry_id = messages
+                        .next()
+                        .ok_or_else(|| ParseMessageError::expect("XADD entry id"))?
+                        .get_string()?;
+                    let entry_id = if entry_id == "*" {
+                        None
+                    } else {
+                        Some(entry_id)
+                    };
+                    let mut pairs = Vec::with_capacity(messages.len());
+                    while let Some(message) = messages.next() {
+                        let key = message.get_string()?;
+                        let value = messages
+                            .next()
+                            .ok_or_else(|| ParseMessageError::expect("XADD value"))?
+                            .get_string()?;
+                        pairs.push((key, value));
+                    }
+                    Ok(ReqCommand::XADD {
+                        stream_key,
+                        entry_id,
+                        pairs,
+                    })
+                }
                 _ => Err(ParseMessageError::unsupported(format!("command: {}", data))),
             },
             Err(message) => Err(ParseMessageError::unsupported(format!(
@@ -522,6 +556,22 @@ impl From<ReqCommand> for Message {
                 Message::SimpleStrings("TYPE".to_string()),
                 Message::BulkStrings(Some(key)),
             ]),
+            ReqCommand::XADD {
+                stream_key,
+                entry_id,
+                pairs,
+            } => {
+                let mut messages = Vec::with_capacity(pairs.len() * 2 + 2);
+                messages.push(Message::BulkStrings(Some(stream_key)));
+                if let Some(entry_id) = entry_id {
+                    messages.push(Message::BulkStrings(Some(entry_id)));
+                }
+                for (k, v) in pairs {
+                    messages.push(Message::BulkStrings(Some(k)));
+                    messages.push(Message::BulkStrings(Some(v)));
+                }
+                Message::Arrays(messages)
+            }
         }
     }
 }
