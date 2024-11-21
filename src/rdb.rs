@@ -5,7 +5,7 @@ use std::path::Path;
 use bytes::{Buf, Bytes};
 use tracing::{debug, info};
 
-use crate::db::{Db, ExpireTable, KvTable};
+use crate::db::{Db, ExpireTable, KvTable, Value};
 
 const EOF: u8 = 0xFF;
 const SELECTDB: u8 = 0xFE;
@@ -145,7 +145,7 @@ fn parse_rdb_file(buf: &mut Bytes) -> ParseResult<(KvTable, ExpireTable)> {
         let value = parse_value(buf, value_type)?;
         debug!("key: {:?}, value: {:?}", key, value);
 
-        kv_table.insert(key.clone(), value);
+        kv_table.insert(key.clone(), Value::String(value));
         if let Some(expire_time) = expire_time {
             expire_table.insert(key, expire_time);
         }

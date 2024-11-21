@@ -3,7 +3,7 @@ use futures_util::{SinkExt, StreamExt};
 use hex_literal::hex;
 use redis_starter_rust::{
     command::{ConfigSubCommand, ReplConfSubresponse, ReplconfSubcommand, ReqCommand, RespCommand},
-    db::Db,
+    db::{Db, Value},
     message::MessageFramer,
     rdb,
     replica::{ReplicaManager, ReplicaNotifyMessage},
@@ -216,10 +216,10 @@ async fn process_client_socket<const NOT_SLAVE: bool>(
                         {
                             RespCommand::Nil
                         } else {
-                            RespCommand::Bulk(value)
+                            value.into()
                         }
                     } else {
-                        RespCommand::Bulk(value)
+                        value.into()
                     }
                 } else {
                     RespCommand::Nil
@@ -241,7 +241,7 @@ async fn process_client_socket<const NOT_SLAVE: bool>(
                 });
                 {
                     let mut db = db.write().await;
-                    db.kv.insert(key.clone(), value.clone());
+                    db.kv.insert(key.clone(), Value::String(value.clone()));
 
                     if let Some(expired_time) = expired_time {
                         db.expire.insert(key.clone(), expired_time);
@@ -343,6 +343,15 @@ async fn process_client_socket<const NOT_SLAVE: bool>(
                     socket
                         .send(RespCommand::Int(replicas as i64).into())
                         .await?;
+                }
+            }
+            ReqCommand::Type(key) => {
+                if NOT_SLAVE {
+                    let ty = {
+                        let db = db.read().await;
+                        Value::ty(db.kv.get(key))
+                    };
+                    socket.send(RespCommand::Simple(ty).into()).await?
                 }
             }
             cmd => {

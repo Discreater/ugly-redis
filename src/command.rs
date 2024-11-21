@@ -2,7 +2,7 @@ use std::{num::ParseIntError, time::Duration, vec};
 use thiserror::Error;
 use tracing::{error, trace};
 
-use crate::message::Message;
+use crate::{db::Value, message::Message};
 
 type ReplId = String;
 type ReplOffset = usize;
@@ -30,6 +30,7 @@ pub enum ReqCommand {
         number_replicas: usize,
         time_out: usize,
     },
+    Type(String),
 }
 
 #[derive(Debug, Clone)]
@@ -52,6 +53,15 @@ pub enum RespCommand {
     Nil,
     Simple(&'static str),
     Int(i64),
+}
+
+impl From<Value> for RespCommand {
+    fn from(value: Value) -> Self {
+        match value {
+            Value::String(s) => RespCommand::Bulk(s),
+            _ => unimplemented!(),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -268,6 +278,13 @@ impl ReqCommand {
                         time_out: timeout,
                     })
                 }
+                "TYPE" => {
+                    let key = messages
+                        .next()
+                        .ok_or_else(|| ParseMessageError::expect("TYPE key"))?
+                        .get_string()?;
+                    Ok(ReqCommand::Type(key))
+                }
                 _ => Err(ParseMessageError::unsupported(format!("command: {}", data))),
             },
             Err(message) => Err(ParseMessageError::unsupported(format!(
@@ -417,22 +434,22 @@ impl From<ReqCommand> for Message {
                 ConfigSubCommand::GET(key) => Message::Arrays(vec![
                     Message::SimpleStrings("CONFIG".to_string()),
                     Message::SimpleStrings("GET".to_string()),
-                    Message::SimpleStrings(key),
+                    Message::BulkStrings(Some(key)),
                 ]),
             },
             ReqCommand::Echo(data) => Message::Arrays(vec![
                 Message::SimpleStrings("ECHO".to_string()),
-                Message::SimpleStrings(data),
+                Message::BulkStrings(Some(data)),
             ]),
             ReqCommand::Get(key) => Message::Arrays(vec![
                 Message::SimpleStrings("GET".to_string()),
-                Message::SimpleStrings(key),
+                Message::BulkStrings(Some(key)),
             ]),
             ReqCommand::Info(key) => {
                 if let Some(key) = key {
                     Message::Arrays(vec![
                         Message::SimpleStrings("INFO".to_string()),
-                        Message::SimpleStrings(key),
+                        Message::BulkStrings(Some(key)),
                     ])
                 } else {
                     Message::Arrays(vec![Message::SimpleStrings("INFO".to_string())])
@@ -440,13 +457,13 @@ impl From<ReqCommand> for Message {
             }
             ReqCommand::KEYS(pattern) => Message::Arrays(vec![
                 Message::SimpleStrings("KEYS".to_string()),
-                Message::SimpleStrings(pattern),
+                Message::BulkStrings(Some(pattern)),
             ]),
             ReqCommand::Set { key, value, px } => {
                 let mut messages = vec![
                     Message::SimpleStrings("SET".to_string()),
-                    Message::SimpleStrings(key),
-                    Message::SimpleStrings(value),
+                    Message::BulkStrings(Some(key)),
+                    Message::BulkStrings(Some(value)),
                 ];
                 if let Some(px) = px {
                     messages.push(Message::SimpleStrings("PX".to_string()));
@@ -500,6 +517,10 @@ impl From<ReqCommand> for Message {
                 Message::SimpleStrings("WAIT".to_string()),
                 Message::SimpleStrings(number_replicas.to_string()),
                 Message::SimpleStrings(time_out.to_string()),
+            ]),
+            ReqCommand::Type(key) => Message::Arrays(vec![
+                Message::SimpleStrings("TYPE".to_string()),
+                Message::BulkStrings(Some(key)),
             ]),
         }
     }
