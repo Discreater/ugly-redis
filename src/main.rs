@@ -3,8 +3,8 @@ use futures_util::{SinkExt, StreamExt};
 use hex_literal::hex;
 use redis_starter_rust::{
     command::{ConfigSubCommand, ReplConfSubresponse, ReplconfSubcommand, ReqCommand, RespCommand},
-    db::{Db, StreamEntry, Value},
-    message::MessageFramer,
+    db::{Db, StreamEntry, Value, ValueError},
+    message::{Message, MessageFramer},
     rdb,
     replica::{ReplicaManager, ReplicaNotifyMessage},
 };
@@ -361,25 +361,26 @@ async fn process_client_socket<const NOT_SLAVE: bool>(
             } => {
                 if NOT_SLAVE {
                     if let Some(entry_id) = entry_id {
-                        {
+                        let push_res = {
                             let mut db = db.write().await;
-                            let entry = db
+                            let db_entry = db
                                 .kv
                                 .entry(stream_key.clone())
                                 .or_insert_with(|| Value::Stream(vec![]));
-                            match entry {
-                                Value::Stream(stream) => {
-                                    stream.push(StreamEntry {
-                                        id: entry_id.to_string(),
-                                        pairs: pairs.clone(),
-                                    });
-                                }
-                                _ => bail!("value of key '{stream_key}' is not a stream!")
+                            let stream_entry = StreamEntry::new(entry_id, pairs.clone())?;
+                            db_entry.push_stream_entry(stream_entry)
+                        };
+                        match push_res {
+                            Ok(_) => {
+                                socket
+                                    .send(RespCommand::Bulk(entry_id.to_string()).into())
+                                    .await?
                             }
+                            Err(ValueError::RespError(resp)) => {
+                                socket.send(Message::SimpleErrors(resp.to_string())).await?
+                            }
+                            Err(e) => return Err(e.into()),
                         }
-                        socket
-                            .send(RespCommand::Bulk(entry_id.to_string()).into())
-                            .await?
                     }
                 }
             }

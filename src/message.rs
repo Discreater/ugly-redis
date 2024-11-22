@@ -7,12 +7,20 @@ use crate::command::{ParseMessageError, ReqCommand, RespCommand};
 
 const CRLF: &[u8] = b"\r\n";
 
+#[derive(thiserror::Error, Debug)]
+pub enum RespError {
+    #[error("ERR The ID specified in XADD is equal or smaller than the target stream top item")]
+    StreamEntryIdDecrease,
+    #[error("ERR The ID specified in XADD must be greater than 0-0")]
+    StreamEntryIdZero,
+}
+
 #[derive(Debug, PartialEq, Clone)]
 pub enum Message {
     // RESP2 	Simple 	+
     SimpleStrings(String),
     // RESP2 	Simple 	-
-    SimpleErrors,
+    SimpleErrors(String),
     // RESP2 	Simple 	:
     Integers(i64),
     // RESP2 	Aggregate 	$
@@ -140,6 +148,13 @@ impl Message {
                 dst.extend_from_slice(data.as_bytes());
                 dst.extend_from_slice(CRLF);
             }
+            Message::SimpleErrors(data) => {
+                debug_assert!(data.find('\r').is_none());
+                debug_assert!(data.find('\n').is_none());
+                dst.extend_from_slice(b"-");
+                dst.extend_from_slice(data.as_bytes());
+                dst.extend_from_slice(CRLF);
+            }
             Message::Rdb(content) => {
                 // bulk strings withouth the trailing CRLF.
                 dst.extend_from_slice(b"$");
@@ -228,6 +243,22 @@ impl Parser<'_> {
                     }
                     self.idx += 2;
                     return Ok(Some(Message::SimpleStrings(data)));
+                } else {
+                    Ok(None)
+                }
+            }
+            b'-' => {
+                let end = self.remain().iter().position(|&b| b == b'\r');
+                if let Some(end) = end {
+                    let data = self.advance_unchecked(end);
+                    let data = String::from_utf8(data.to_vec()).map_err(|_| {
+                        io::Error::new(io::ErrorKind::InvalidData, "invalid utf8 string")
+                    })?;
+                    if !self.remain().starts_with(CRLF) {
+                        return Err(io::Error::new(io::ErrorKind::InvalidData, "expected CRLF"));
+                    }
+                    self.idx += 2;
+                    return Ok(Some(Message::SimpleErrors(data)));
                 } else {
                     Ok(None)
                 }
