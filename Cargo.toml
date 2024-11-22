@@ -29,3 +29,4 @@ futures-util = { version = "0.3.30", features = ["sink"] }
 tracing = "0.1"
 tracing-subscriber = "0.3"
 hex-literal = "0.4.1"
+chrono = "0.4.38"

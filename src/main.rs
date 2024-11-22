@@ -3,7 +3,7 @@ use futures_util::{SinkExt, StreamExt};
 use hex_literal::hex;
 use redis_starter_rust::{
     command::{ConfigSubCommand, ReplConfSubresponse, ReplconfSubcommand, ReqCommand, RespCommand},
-    db::{Db, StreamEntry, Value, ValueError},
+    db::{Db, Value, ValueError},
     message::{Message, MessageFramer},
     rdb,
     replica::{ReplicaManager, ReplicaNotifyMessage},
@@ -367,13 +367,12 @@ async fn process_client_socket<const NOT_SLAVE: bool>(
                                 .kv
                                 .entry(stream_key.clone())
                                 .or_insert_with(|| Value::Stream(vec![]));
-                            let stream_entry = StreamEntry::new(entry_id, pairs.clone())?;
-                            db_entry.push_stream_entry(stream_entry)
+                            db_entry.push_stream_entry(&entry_id, pairs.clone())
                         };
                         match push_res {
-                            Ok(_) => {
+                            Ok(id) => {
                                 socket
-                                    .send(RespCommand::Bulk(entry_id.to_string()).into())
+                                    .send(RespCommand::Bulk(id.to_string()).into())
                                     .await?
                             }
                             Err(ValueError::RespError(resp)) => {

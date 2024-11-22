@@ -1,6 +1,7 @@
+use core::fmt;
 use std::collections::HashMap;
 
-use anyhow::bail;
+use tracing::warn;
 
 use crate::message::RespError;
 
@@ -29,37 +30,81 @@ pub enum ValueError {
     TypeError { expect: String, got: String },
     #[error(transparent)]
     RespError(#[from] RespError),
+    #[error("unsupported entry id: {0}")]
+    Unsupported(String),
+    #[error("parse id error while parsing: {0}")]
+    ParseIdError(String),
 }
 
 impl Value {
-    pub fn push_stream_entry(&mut self, entry: StreamEntry) -> Result<(), ValueError> {
+    fn seq_after(time: u64, top: &EntryId) -> u64 {
+        if time == top.time {
+            top.seq + 1
+        } else {
+            0
+        }
+    }
+    pub fn push_stream_entry(
+        &mut self,
+        id: &str,
+        pairs: Vec<(String, String)>,
+    ) -> Result<EntryId, ValueError> {
         match self {
             Value::Stream(stream) => {
-                if entry.id <= EntryId::ZERO {
+                if id == "0-0" {
                     return Err(RespError::StreamEntryIdZero.into());
                 }
-                if let Some(top) = stream.last() {
-                    if top.id >= entry.id {
-                        return Err(RespError::StreamEntryIdDecrease.into());
+                let top = stream.last().map(|e| &e.id).unwrap_or(&EntryId::ZERO);
+
+                let id = if id == "*" {
+                    // current unix time in milliseconds
+                    let time = chrono::Utc::now().timestamp_millis() as u64;
+                    let seq = Value::seq_after(time, top);
+                    EntryId { time, seq }
+                } else {
+                    let splitted = id.split('-').collect::<Vec<_>>();
+                    if splitted.len() != 2 {
+                        return Err(ValueError::Unsupported(format!("entry id: {id}")));
                     }
+                    let time: u64 = splitted[0]
+                        .parse()
+                        .map_err(|_| ValueError::ParseIdError("time".to_string()))?;
+                    let seq = splitted[1];
+
+                    let seq = if seq == "*" {
+                        Value::seq_after(time, top)
+                    } else {
+                        seq.parse()
+                            .map_err(|_| ValueError::ParseIdError("sequence".to_string()))?
+                    };
+                    EntryId { time, seq }
+                };
+                warn!("pushing id: {id}, top id: {top}");
+                if &id <= top {
+                    return Err(RespError::StreamEntryIdDecrease.into());
                 }
-                stream.push(entry);
+
+                stream.push(StreamEntry { id, pairs });
+                Ok(id)
             }
-            _ => {
-                return Err(ValueError::TypeError {
-                    expect: "stream".to_string(),
-                    got: Value::ty(Some(self)).to_string(),
-                })
-            }
+            _ => Err(ValueError::TypeError {
+                expect: "stream".to_string(),
+                got: Value::ty(Some(self)).to_string(),
+            }),
         }
-        Ok(())
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct EntryId {
     time: u64,
     seq: u64,
+}
+
+impl fmt::Display for EntryId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}-{}", self.time, self.seq)
+    }
 }
 
 impl EntryId {
@@ -86,23 +131,6 @@ impl PartialOrd for EntryId {
 pub struct StreamEntry {
     pub id: EntryId,
     pub pairs: Vec<(String, String)>,
-}
-
-impl StreamEntry {
-    pub fn new(id: &str, pairs: Vec<(String, String)>) -> anyhow::Result<Self> {
-        let id = if id == "*" {
-            unimplemented!()
-        } else {
-            let splitted = id.split('-').collect::<Vec<_>>();
-            if splitted.len() != 2 {
-                bail!("unsuppored entry id: {id}");
-            }
-            let time = splitted[0].parse()?;
-            let seq = splitted[1].parse()?;
-            EntryId { time, seq }
-        };
-        Ok(StreamEntry { id, pairs })
-    }
 }
 
 impl Value {
