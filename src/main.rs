@@ -360,26 +360,25 @@ async fn process_client_socket<const NOT_SLAVE: bool>(
                 pairs,
             } => {
                 if NOT_SLAVE {
-                    if let Some(entry_id) = entry_id {
-                        let push_res = {
-                            let mut db = db.write().await;
-                            let db_entry = db
-                                .kv
-                                .entry(stream_key.clone())
-                                .or_insert_with(|| Value::Stream(vec![]));
-                            db_entry.push_stream_entry(&entry_id, pairs.clone())
-                        };
-                        match push_res {
-                            Ok(id) => {
-                                socket
-                                    .send(RespCommand::Bulk(id.to_string()).into())
-                                    .await?
-                            }
-                            Err(ValueError::RespError(resp)) => {
-                                socket.send(Message::SimpleErrors(resp.to_string())).await?
-                            }
-                            Err(e) => return Err(e.into()),
+                    let push_res = {
+                        let mut db = db.write().await;
+                        let db_entry = db
+                            .kv
+                            .entry(stream_key.clone())
+                            .or_insert_with(|| Value::Stream(vec![]));
+                        db_entry.push_stream_entry(&entry_id, pairs.clone())
+                    };
+                    match push_res {
+                        Ok(id) => {
+                            socket
+                                .send(RespCommand::Bulk(id.to_string()).into())
+                                .await?
                         }
+                        Err(ValueError::RespError(resp)) => {
+                            warn!("{resp}");
+                            socket.send(Message::SimpleErrors(resp.to_string())).await?
+                        }
+                        Err(e) => return Err(e.into()),
                     }
                 }
             }

@@ -33,7 +33,7 @@ pub enum ReqCommand {
     Type(String),
     XADD {
         stream_key: String,
-        entry_id: Option<String>,
+        entry_id: String,
         pairs: Vec<(String, String)>,
     },
 }
@@ -299,11 +299,6 @@ impl ReqCommand {
                         .next()
                         .ok_or_else(|| ParseMessageError::expect("XADD entry id"))?
                         .get_string()?;
-                    let entry_id = if entry_id == "*" {
-                        None
-                    } else {
-                        Some(entry_id)
-                    };
                     let mut pairs = Vec::with_capacity(messages.len());
                     while let Some(message) = messages.next() {
                         let key = message.get_string()?;
@@ -563,9 +558,7 @@ impl From<ReqCommand> for Message {
             } => {
                 let mut messages = Vec::with_capacity(pairs.len() * 2 + 2);
                 messages.push(Message::BulkStrings(Some(stream_key)));
-                if let Some(entry_id) = entry_id {
-                    messages.push(Message::BulkStrings(Some(entry_id)));
-                }
+                messages.push(Message::BulkStrings(Some(entry_id)));
                 for (k, v) in pairs {
                     messages.push(Message::BulkStrings(Some(k)));
                     messages.push(Message::BulkStrings(Some(v)));

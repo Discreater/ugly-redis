@@ -1,7 +1,7 @@
 use core::fmt;
 use std::collections::HashMap;
 
-use tracing::warn;
+use tracing::trace;
 
 use crate::message::RespError;
 
@@ -79,7 +79,7 @@ impl Value {
                     };
                     EntryId { time, seq }
                 };
-                warn!("pushing id: {id}, top id: {top}");
+                trace!("pushing id: {id}, top id: {top}");
                 if &id <= top {
                     return Err(RespError::StreamEntryIdDecrease.into());
                 }
