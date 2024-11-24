@@ -1,4 +1,4 @@
-use std::{num::ParseIntError, time::Duration, vec};
+use std::{num::ParseIntError, time::Duration, u64, vec};
 use thiserror::Error;
 use tracing::{error, trace};
 
@@ -342,6 +342,10 @@ impl ReqCommand {
                         if IS_START {
                             if id == "-" {
                                 return Ok(EntryId::ZERO);
+                            }
+                        } else {
+                            if id == "+" {
+                                return Ok(EntryId::new(u64::MAX, u64::MAX));
                             }
                         }
                         if id.contains('-') {
