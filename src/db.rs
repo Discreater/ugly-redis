@@ -133,7 +133,7 @@ impl fmt::Display for EntryId {
 }
 
 impl EntryId {
-    const ZERO: Self = Self { time: 0, seq: 0 };
+    pub const ZERO: Self = Self { time: 0, seq: 0 };
 
     pub fn new(time: u64, seq: u64) -> Self {
         Self { time, seq }

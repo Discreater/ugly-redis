@@ -336,9 +336,14 @@ impl ReqCommand {
                         .next()
                         .ok_or_else(|| ParseMessageError::expect("XRANGE start id"))?
                         .get_string()?;
-                    fn parse_xrange_entry_id<const DEFAULT_SEQ: u64>(
+                    fn parse_xrange_entry_id<const IS_START: bool>(
                         id: &str,
                     ) -> Result<EntryId, ParseMessageError> {
+                        if IS_START {
+                            if id == "-" {
+                                return Ok(EntryId::ZERO);
+                            }
+                        }
                         if id.contains('-') {
                             let splitted = id.split('-').collect::<Vec<_>>();
                             if splitted.len() != 2 {
@@ -352,14 +357,14 @@ impl ReqCommand {
                             Ok(EntryId::new(time, seq))
                         } else {
                             let time = id.parse()?;
-                            Ok(EntryId::new(time, DEFAULT_SEQ))
+                            Ok(EntryId::new(time, if IS_START { 0 } else { u64::MAX }))
                         }
                     }
 
                     Ok(ReqCommand::XRANGE {
                         stream_key,
-                        start_id: parse_xrange_entry_id::<0>(&start_id)?,
-                        end_id: parse_xrange_entry_id::<{ u64::MAX }>(&end_id)?,
+                        start_id: parse_xrange_entry_id::<true>(&start_id)?,
+                        end_id: parse_xrange_entry_id::<false>(&end_id)?,
                     })
                 }
                 _ => Err(ParseMessageError::unsupported(format!("command: {}", data))),
