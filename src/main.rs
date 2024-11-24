@@ -382,6 +382,16 @@ async fn process_client_socket<const NOT_SLAVE: bool>(
                     }
                 }
             }
+            ReqCommand::XRANGE { stream_key, start_id, end_id } => {
+                if NOT_SLAVE {
+                    let entries = {
+                        let db = db.read().await;
+                        let db_entry = db.kv.get(stream_key);
+                        db_entry.map(|entry| entry.xrange(start_id, end_id)).transpose()?.unwrap_or_default()
+                    };
+                    socket.send(RespCommand::StreamEntries(entries).into()).await?;
+                }
+            }
             cmd => {
                 error!("unsupported command: {:?}", cmd);
             }

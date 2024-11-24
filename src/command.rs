@@ -2,7 +2,10 @@ use std::{num::ParseIntError, time::Duration, vec};
 use thiserror::Error;
 use tracing::{error, trace};
 
-use crate::{db::Value, message::Message};
+use crate::{
+    db::{EntryId, StreamEntry, Value},
+    message::Message,
+};
 
 type ReplId = String;
 type ReplOffset = usize;
@@ -36,6 +39,11 @@ pub enum ReqCommand {
         entry_id: String,
         pairs: Vec<(String, String)>,
     },
+    XRANGE {
+        stream_key: String,
+        start_id: EntryId,
+        end_id: EntryId,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -58,6 +66,7 @@ pub enum RespCommand {
     Nil,
     Simple(&'static str),
     Int(i64),
+    StreamEntries(Vec<StreamEntry>),
 }
 
 impl From<Value> for RespCommand {
@@ -314,6 +323,45 @@ impl ReqCommand {
                         pairs,
                     })
                 }
+                "XRANGE" => {
+                    let stream_key = messages
+                        .next()
+                        .ok_or_else(|| ParseMessageError::expect("XRANGE stream key"))?
+                        .get_string()?;
+                    let start_id = messages
+                        .next()
+                        .ok_or_else(|| ParseMessageError::expect("XRANGE start id"))?
+                        .get_string()?;
+                    let end_id = messages
+                        .next()
+                        .ok_or_else(|| ParseMessageError::expect("XRANGE start id"))?
+                        .get_string()?;
+                    fn parse_xrange_entry_id<const DEFAULT_SEQ: u64>(
+                        id: &str,
+                    ) -> Result<EntryId, ParseMessageError> {
+                        if id.contains('-') {
+                            let splitted = id.split('-').collect::<Vec<_>>();
+                            if splitted.len() != 2 {
+                                return Err(ParseMessageError::unsupported(format!(
+                                    "entry id: {}",
+                                    id
+                                )));
+                            }
+                            let time: u64 = splitted[0].parse().unwrap();
+                            let seq: u64 = splitted[1].parse().unwrap();
+                            Ok(EntryId::new(time, seq))
+                        } else {
+                            let time = id.parse()?;
+                            Ok(EntryId::new(time, DEFAULT_SEQ))
+                        }
+                    }
+
+                    Ok(ReqCommand::XRANGE {
+                        stream_key,
+                        start_id: parse_xrange_entry_id::<0>(&start_id)?,
+                        end_id: parse_xrange_entry_id::<{ u64::MAX }>(&end_id)?,
+                    })
+                }
                 _ => Err(ParseMessageError::unsupported(format!("command: {}", data))),
             },
             Err(message) => Err(ParseMessageError::unsupported(format!(
@@ -451,6 +499,22 @@ impl From<RespCommand> for Message {
                 Message::Arrays(messages)
             }
             RespCommand::Int(v) => Message::Integers(v),
+            RespCommand::StreamEntries(entries) => Message::Arrays(
+                entries
+                    .into_iter()
+                    .map(|e| {
+                        let mut kv_messages = Vec::with_capacity(e.pairs.len() * 2);
+                        for (k, v) in e.pairs {
+                            kv_messages.push(Message::BulkStrings(Some(k)));
+                            kv_messages.push(Message::BulkStrings(Some(v)));
+                        }
+                        Message::Arrays(vec![
+                            Message::SimpleStrings(e.id.to_string()),
+                            Message::Arrays(kv_messages),
+                        ])
+                    })
+                    .collect(),
+            ),
         }
     }
 }
@@ -557,6 +621,7 @@ impl From<ReqCommand> for Message {
                 pairs,
             } => {
                 let mut messages = Vec::with_capacity(pairs.len() * 2 + 2);
+                messages.push(Message::SimpleStrings("XADD".to_string()));
                 messages.push(Message::BulkStrings(Some(stream_key)));
                 messages.push(Message::BulkStrings(Some(entry_id)));
                 for (k, v) in pairs {
@@ -565,6 +630,16 @@ impl From<ReqCommand> for Message {
                 }
                 Message::Arrays(messages)
             }
+            ReqCommand::XRANGE {
+                stream_key,
+                start_id,
+                end_id,
+            } => Message::Arrays(vec![
+                Message::SimpleStrings("XRANGE".to_string()),
+                Message::BulkStrings(Some(stream_key)),
+                Message::SimpleStrings(start_id.to_string()),
+                Message::SimpleStrings(end_id.to_string()),
+            ]),
         }
     }
 }

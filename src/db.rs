@@ -49,44 +49,69 @@ impl Value {
         id: &str,
         pairs: Vec<(String, String)>,
     ) -> Result<EntryId, ValueError> {
-        match self {
-            Value::Stream(stream) => {
-                if id == "0-0" {
-                    return Err(RespError::StreamEntryIdZero.into());
-                }
-                let top = stream.last().map(|e| &e.id).unwrap_or(&EntryId::ZERO);
+        let stream = self.stream_entries_mut()?;
+        if id == "0-0" {
+            return Err(RespError::StreamEntryIdZero.into());
+        }
+        let top = stream.last().map(|e| &e.id).unwrap_or(&EntryId::ZERO);
 
-                let id = if id == "*" {
-                    // current unix time in milliseconds
-                    let time = chrono::Utc::now().timestamp_millis() as u64;
-                    let seq = Value::seq_after(time, top);
-                    EntryId { time, seq }
-                } else {
-                    let splitted = id.split('-').collect::<Vec<_>>();
-                    if splitted.len() != 2 {
-                        return Err(ValueError::Unsupported(format!("entry id: {id}")));
-                    }
-                    let time: u64 = splitted[0]
-                        .parse()
-                        .map_err(|_| ValueError::ParseIdError("time".to_string()))?;
-                    let seq = splitted[1];
-
-                    let seq = if seq == "*" {
-                        Value::seq_after(time, top)
-                    } else {
-                        seq.parse()
-                            .map_err(|_| ValueError::ParseIdError("sequence".to_string()))?
-                    };
-                    EntryId { time, seq }
-                };
-                trace!("pushing id: {id}, top id: {top}");
-                if &id <= top {
-                    return Err(RespError::StreamEntryIdDecrease.into());
-                }
-
-                stream.push(StreamEntry { id, pairs });
-                Ok(id)
+        let id = if id == "*" {
+            // current unix time in milliseconds
+            let time = chrono::Utc::now().timestamp_millis() as u64;
+            let seq = Value::seq_after(time, top);
+            EntryId { time, seq }
+        } else {
+            let splitted = id.split('-').collect::<Vec<_>>();
+            if splitted.len() != 2 {
+                return Err(ValueError::Unsupported(format!("entry id: {id}")));
             }
+            let time: u64 = splitted[0]
+                .parse()
+                .map_err(|_| ValueError::ParseIdError("time".to_string()))?;
+            let seq = splitted[1];
+
+            let seq = if seq == "*" {
+                Value::seq_after(time, top)
+            } else {
+                seq.parse()
+                    .map_err(|_| ValueError::ParseIdError("sequence".to_string()))?
+            };
+            EntryId { time, seq }
+        };
+        trace!("pushing id: {id}, top id: {top}");
+        if &id <= top {
+            return Err(RespError::StreamEntryIdDecrease.into());
+        }
+
+        stream.push(StreamEntry { id, pairs });
+        Ok(id)
+    }
+
+    pub fn xrange(&self, start: &EntryId, end: &EntryId) -> Result<Vec<StreamEntry>, ValueError> {
+        let entries = self.stream_entries()?;
+        let start_pos = match entries.binary_search_by_key(start, |e| e.id) {
+            Ok(i) => i,
+            Err(i) => i,
+        };
+        let end_pos = match entries.binary_search_by_key(end, |e| e.id) {
+            Ok(i) => i + 1,
+            Err(i) => i,
+        };
+        Ok(entries[start_pos..end_pos].to_vec())
+    }
+
+    fn stream_entries(&self) -> Result<&Vec<StreamEntry>, ValueError> {
+        match self {
+            Value::Stream(entries) => Ok(entries),
+            _ => Err(ValueError::TypeError {
+                expect: "stream".to_string(),
+                got: Value::ty(Some(self)).to_string(),
+            }),
+        }
+    }
+    fn stream_entries_mut(&mut self) -> Result<&mut Vec<StreamEntry>, ValueError> {
+        match self {
+            Value::Stream(entries) => Ok(entries),
             _ => Err(ValueError::TypeError {
                 expect: "stream".to_string(),
                 got: Value::ty(Some(self)).to_string(),
@@ -109,6 +134,10 @@ impl fmt::Display for EntryId {
 
 impl EntryId {
     const ZERO: Self = Self { time: 0, seq: 0 };
+
+    pub fn new(time: u64, seq: u64) -> Self {
+        Self { time, seq }
+    }
 }
 
 impl Ord for EntryId {
@@ -127,10 +156,22 @@ impl PartialOrd for EntryId {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StreamEntry {
     pub id: EntryId,
     pub pairs: Vec<(String, String)>,
+}
+
+impl Ord for StreamEntry {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.id.cmp(&other.id)
+    }
+}
+
+impl PartialOrd for StreamEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(&other))
+    }
 }
 
 impl Value {
