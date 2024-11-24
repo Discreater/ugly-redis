@@ -1,5 +1,5 @@
 use core::fmt;
-use std::collections::HashMap;
+use std::{collections::HashMap, u64};
 
 use tracing::trace;
 
@@ -134,6 +134,10 @@ impl fmt::Display for EntryId {
 
 impl EntryId {
     pub const ZERO: Self = Self { time: 0, seq: 0 };
+    pub const MAX: Self = Self {
+        time: u64::MAX,
+        seq: u64::MAX,
+    };
 
     pub fn new(time: u64, seq: u64) -> Self {
         Self { time, seq }

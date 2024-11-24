@@ -68,6 +68,14 @@ impl Message {
         }
     }
 
+    pub(crate) fn get_string_ref(&self) -> Result<&String, &Self> {
+        Ok(match self {
+            Message::BulkStrings(Some(data)) => data,
+            Message::SimpleStrings(data) => data,
+            _ => return Err(self),
+        })
+    }
+
     pub fn parse_resp(self) -> Result<RespCommand, ParseMessageError> {
         RespCommand::parse(self)
     }

@@ -41,9 +41,19 @@ pub enum ReqCommand {
     },
     XRANGE {
         stream_key: String,
+        /// inclusive
         start_id: EntryId,
+        /// inclusive
         end_id: EntryId,
     },
+    XREAD(Vec<XReadItem>),
+}
+
+#[derive(Debug, Clone)]
+pub struct XReadItem {
+    pub stream_key: String,
+    /// exclusive
+    pub start: EntryId,
 }
 
 #[derive(Debug, Clone)]
@@ -102,6 +112,12 @@ pub enum ParseMessageError {
 impl From<Message> for ParseMessageError {
     fn from(message: Message) -> ParseMessageError {
         ParseMessageError::ExpectString(message)
+    }
+}
+
+impl From<&'_ Message> for ParseMessageError {
+    fn from(message: &Message) -> ParseMessageError {
+        ParseMessageError::ExpectString(message.clone())
     }
 }
 
@@ -336,40 +352,46 @@ impl ReqCommand {
                         .next()
                         .ok_or_else(|| ParseMessageError::expect("XRANGE start id"))?
                         .get_string()?;
-                    fn parse_xrange_entry_id<const IS_START: bool>(
-                        id: &str,
-                    ) -> Result<EntryId, ParseMessageError> {
-                        if IS_START {
-                            if id == "-" {
-                                return Ok(EntryId::ZERO);
-                            }
-                        } else {
-                            if id == "+" {
-                                return Ok(EntryId::new(u64::MAX, u64::MAX));
-                            }
-                        }
-                        if id.contains('-') {
-                            let splitted = id.split('-').collect::<Vec<_>>();
-                            if splitted.len() != 2 {
-                                return Err(ParseMessageError::unsupported(format!(
-                                    "entry id: {}",
-                                    id
-                                )));
-                            }
-                            let time: u64 = splitted[0].parse().unwrap();
-                            let seq: u64 = splitted[1].parse().unwrap();
-                            Ok(EntryId::new(time, seq))
-                        } else {
-                            let time = id.parse()?;
-                            Ok(EntryId::new(time, if IS_START { 0 } else { u64::MAX }))
-                        }
-                    }
 
                     Ok(ReqCommand::XRANGE {
                         stream_key,
-                        start_id: parse_xrange_entry_id::<true>(&start_id)?,
-                        end_id: parse_xrange_entry_id::<false>(&end_id)?,
+                        start_id: parse_entry_id::<true>(&start_id)?,
+                        end_id: parse_entry_id::<false>(&end_id)?,
                     })
+                }
+                "XREAD" => {
+                    let sub = messages
+                        .next()
+                        .ok_or_else(|| ParseMessageError::expect("XREAD sub type"))?
+                        .get_string()?;
+                    if sub != "streams" {
+                        unimplemented!("XREAD sub of: {sub}")
+                    }
+                    let messages: Vec<_> = messages.collect();
+                    if messages.len() % 2 != 0 {
+                        return Err(ParseMessageError::unsupported("XREAD items not even"));
+                    }
+                    let (keys, start_ids) = messages.split_at(messages.len() / 2);
+                    let keys: Vec<_> = keys
+                        .iter()
+                        .map(|m| m.get_string_cloned())
+                        .collect::<Result<_, _>>()?;
+                    let start_ids: Vec<_> = start_ids
+                        .iter()
+                        .map(|m| {
+                            let start_id = m.get_string_ref()?;
+                            parse_entry_id::<true>(start_id)
+                        })
+                        .collect::<Result<_, ParseMessageError>>()?;
+                    let items = keys
+                        .into_iter()
+                        .zip(start_ids)
+                        .map(|(k, s)| XReadItem {
+                            stream_key: k,
+                            start: s,
+                        })
+                        .collect();
+                    Ok(ReqCommand::XREAD(items))
                 }
                 _ => Err(ParseMessageError::unsupported(format!("command: {}", data))),
             },
@@ -378,6 +400,30 @@ impl ReqCommand {
                 message
             ))),
         }
+    }
+}
+
+fn parse_entry_id<const IS_START: bool>(id: &str) -> Result<EntryId, ParseMessageError> {
+    if IS_START {
+        if id == "-" {
+            return Ok(EntryId::ZERO);
+        }
+    } else {
+        if id == "+" {
+            return Ok(EntryId::MAX);
+        }
+    }
+    if id.contains('-') {
+        let splitted = id.split('-').collect::<Vec<_>>();
+        if splitted.len() != 2 {
+            return Err(ParseMessageError::unsupported(format!("entry id: {}", id)));
+        }
+        let time: u64 = splitted[0].parse().unwrap();
+        let seq: u64 = splitted[1].parse().unwrap();
+        Ok(EntryId::new(time, seq))
+    } else {
+        let time = id.parse()?;
+        Ok(EntryId::new(time, if IS_START { 0 } else { u64::MAX }))
     }
 }
 
@@ -649,6 +695,18 @@ impl From<ReqCommand> for Message {
                 Message::SimpleStrings(start_id.to_string()),
                 Message::SimpleStrings(end_id.to_string()),
             ]),
+            ReqCommand::XREAD(items) => {
+                let mut key_messages = Vec::with_capacity(items.len() * 2 + 2);
+                let mut start_messages = Vec::with_capacity(items.len());
+                key_messages.push(Message::SimpleStrings("XREAD".to_string()));
+                key_messages.push(Message::SimpleStrings("streams".to_string()));
+                for item in items {
+                    key_messages.push(Message::BulkStrings(Some(item.stream_key)));
+                    start_messages.push(Message::SimpleStrings(item.start.to_string()));
+                }
+                key_messages.extend(start_messages);
+                Message::Arrays(key_messages)
+            }
         }
     }
 }

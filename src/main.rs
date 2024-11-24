@@ -3,7 +3,7 @@ use futures_util::{SinkExt, StreamExt};
 use hex_literal::hex;
 use redis_starter_rust::{
     command::{ConfigSubCommand, ReplConfSubresponse, ReplconfSubcommand, ReqCommand, RespCommand},
-    db::{Db, Value, ValueError},
+    db::{Db, EntryId, Value, ValueError},
     message::{Message, MessageFramer},
     rdb,
     replica::{ReplicaManager, ReplicaNotifyMessage},
@@ -382,14 +382,52 @@ async fn process_client_socket<const NOT_SLAVE: bool>(
                     }
                 }
             }
-            ReqCommand::XRANGE { stream_key, start_id, end_id } => {
+            ReqCommand::XRANGE {
+                stream_key,
+                start_id,
+                end_id,
+            } => {
                 if NOT_SLAVE {
                     let entries = {
                         let db = db.read().await;
                         let db_entry = db.kv.get(stream_key);
-                        db_entry.map(|entry| entry.xrange(start_id, end_id)).transpose()?.unwrap_or_default()
+                        db_entry
+                            .map(|entry| entry.xrange(start_id, end_id))
+                            .transpose()?
+                            .unwrap_or_default()
                     };
-                    socket.send(RespCommand::StreamEntries(entries).into()).await?;
+                    socket
+                        .send(RespCommand::StreamEntries(entries).into())
+                        .await?;
+                }
+            }
+            ReqCommand::XREAD(items) => {
+                if NOT_SLAVE {
+                    let streams: Vec<_> = {
+                        let db = db.read().await;
+                        items
+                            .iter()
+                            .map(|item| {
+                                let db_entry = db.kv.get(&item.stream_key);
+                                Ok((
+                                    &item.stream_key,
+                                    db_entry
+                                        .map(|entry| entry.xrange(&item.start, &EntryId::MAX))
+                                        .transpose()?
+                                        .unwrap_or_default(),
+                                ))
+                            })
+                            .collect::<Result<_, ValueError>>()?
+                    };
+                    let response = streams
+                        .into_iter()
+                        .map(|(key, entries)| {
+                            let stream_key = Message::BulkStrings(Some(key.clone()));
+                            let entries = Message::from(RespCommand::StreamEntries(entries));
+                            Message::Arrays(vec![stream_key, entries])
+                        })
+                        .collect::<Vec<_>>();
+                    socket.send(Message::Arrays(response)).await?;
                 }
             }
             cmd => {
