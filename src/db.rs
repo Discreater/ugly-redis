@@ -3,7 +3,7 @@ use std::{collections::HashMap, u64};
 
 use tracing::trace;
 
-use crate::message::RespError;
+use crate::{command::ParseMessageError, message::RespError};
 
 pub type KvTable = HashMap<String, Value>;
 pub type ExpireTable = HashMap<String, u64>;
@@ -100,6 +100,16 @@ impl Value {
         Ok(entries[start_pos..end_pos].to_vec())
     }
 
+    pub fn map_xread_raw(&self, id: &str) -> Result<EntryId, ValueError> {
+        let entries = self.stream_entries()?;
+        if id == "$" {
+            return Ok(entries.last().map(|last| last.id).unwrap_or(EntryId::ZERO));
+        }
+        let id = EntryId::parse::<false>(id)
+            .map_err(|_| ValueError::ParseIdError(format!("id: {id}")))?;
+        Ok(id)
+    }
+
     pub fn xread(&self, start: &EntryId) -> Result<Vec<StreamEntry>, ValueError> {
         let entries = self.stream_entries()?;
         let start_pos = match entries.binary_search_by_key(start, |e| e.id) {
@@ -163,6 +173,30 @@ impl EntryId {
                 time: self.time,
                 seq: self.seq + 1,
             }
+        }
+    }
+
+    pub fn parse<const IS_START: bool>(id: &str) -> Result<EntryId, ParseMessageError> {
+        if IS_START {
+            if id == "-" {
+                return Ok(EntryId::ZERO);
+            }
+        } else {
+            if id == "+" {
+                return Ok(EntryId::MAX);
+            }
+        }
+        if id.contains('-') {
+            let splitted = id.split('-').collect::<Vec<_>>();
+            if splitted.len() != 2 {
+                return Err(ParseMessageError::unsupported(format!("entry id: {}", id)));
+            }
+            let time: u64 = splitted[0].parse()?;
+            let seq: u64 = splitted[1].parse()?;
+            Ok(EntryId::new(time, seq))
+        } else {
+            let time = id.parse()?;
+            Ok(EntryId::new(time, if IS_START { 0 } else { u64::MAX }))
         }
     }
 }

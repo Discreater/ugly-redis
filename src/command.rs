@@ -48,7 +48,7 @@ pub enum ReqCommand {
     },
     XREAD {
         block_time: Option<usize>,
-        streams: Vec<XReadItem>,
+        streams: Vec<XReadItemRaw>,
     },
 }
 
@@ -57,6 +57,13 @@ pub enum ReplconfSubcommand {
     ListeningPort(u16),
     Capa(String),
     Getack,
+}
+
+#[derive(Debug, Clone)]
+pub struct XReadItemRaw {
+    pub stream_key: String,
+    /// exclusive
+    pub start: String,
 }
 
 #[derive(Debug, Clone)]
@@ -358,8 +365,8 @@ impl ReqCommand {
 
                     Ok(ReqCommand::XRANGE {
                         stream_key,
-                        start_id: parse_entry_id::<true>(&start_id)?,
-                        end_id: parse_entry_id::<false>(&end_id)?,
+                        start_id: EntryId::parse::<true>(&start_id)?,
+                        end_id: EntryId::parse::<false>(&end_id)?,
                     })
                 }
                 "XREAD" => {
@@ -401,13 +408,13 @@ impl ReqCommand {
                         .iter()
                         .map(|m| {
                             let start_id = m.get_string_ref()?;
-                            parse_entry_id::<true>(start_id)
+                            Ok(start_id.to_string())
                         })
                         .collect::<Result<_, ParseMessageError>>()?;
                     let items = keys
                         .into_iter()
                         .zip(start_ids)
-                        .map(|(k, s)| XReadItem {
+                        .map(|(k, s)| XReadItemRaw {
                             stream_key: k,
                             start: s,
                         })
@@ -424,30 +431,6 @@ impl ReqCommand {
                 message
             ))),
         }
-    }
-}
-
-fn parse_entry_id<const IS_START: bool>(id: &str) -> Result<EntryId, ParseMessageError> {
-    if IS_START {
-        if id == "-" {
-            return Ok(EntryId::ZERO);
-        }
-    } else {
-        if id == "+" {
-            return Ok(EntryId::MAX);
-        }
-    }
-    if id.contains('-') {
-        let splitted = id.split('-').collect::<Vec<_>>();
-        if splitted.len() != 2 {
-            return Err(ParseMessageError::unsupported(format!("entry id: {}", id)));
-        }
-        let time: u64 = splitted[0].parse().unwrap();
-        let seq: u64 = splitted[1].parse().unwrap();
-        Ok(EntryId::new(time, seq))
-    } else {
-        let time = id.parse()?;
-        Ok(EntryId::new(time, if IS_START { 0 } else { u64::MAX }))
     }
 }
 
@@ -730,7 +713,7 @@ impl From<ReqCommand> for Message {
                     key_messages.push(Message::SimpleStrings("block".to_string()));
                     key_messages.push(Message::SimpleStrings(block_time.to_string()));
                 }
-                
+
                 key_messages.push(Message::SimpleStrings("streams".to_string()));
                 for item in streams {
                     key_messages.push(Message::BulkStrings(Some(item.stream_key)));

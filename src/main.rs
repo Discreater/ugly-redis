@@ -2,8 +2,11 @@ use anyhow::{bail, Context};
 use futures_util::{SinkExt, StreamExt};
 use hex_literal::hex;
 use redis_starter_rust::{
-    command::{ConfigSubCommand, ReplConfSubresponse, ReplconfSubcommand, ReqCommand, RespCommand},
-    db::{Db, StreamEntry, Value, ValueError},
+    command::{
+        ConfigSubCommand, ReplConfSubresponse, ReplconfSubcommand, ReqCommand, RespCommand,
+        XReadItem,
+    },
+    db::{Db, EntryId, StreamEntry, Value, ValueError},
     message::{Message, MessageFramer},
     rdb,
     replica::{ReplicaManager, ReplicaNotifyMessage},
@@ -425,7 +428,7 @@ async fn process_client_socket<const NOT_SLAVE: bool>(
                             Ok((
                                 &item.stream_key,
                                 db_entry
-                                    .map(|entry| entry.xread(&item.start))
+                                    .map(|entry: &Value| entry.xread(&item.start))
                                     .transpose()?
                                     .unwrap_or_default(),
                             ))
@@ -437,7 +440,25 @@ async fn process_client_socket<const NOT_SLAVE: bool>(
                 }
 
                 if NOT_SLAVE {
-                    let streams = read_entries(db.clone(), items).await?;
+                    let items = {
+                        let db = db.read().await;
+                        items
+                            .iter()
+                            .map(|item| {
+                                let id = db
+                                    .kv
+                                    .get(&item.stream_key)
+                                    .map(|entry| entry.map_xread_raw(&item.start))
+                                    .transpose()?
+                                    .unwrap_or(EntryId::ZERO);
+                                Ok(XReadItem {
+                                    stream_key: item.stream_key.clone(),
+                                    start: id,
+                                })
+                            })
+                            .collect::<Result<_, ValueError>>()?
+                    };
+                    let streams = read_entries(db.clone(), &items).await?;
                     let streams = if streams.is_empty() {
                         if let Some(block_time) = block_time {
                             debug!("blocking: {block_time}");
@@ -446,7 +467,7 @@ async fn process_client_socket<const NOT_SLAVE: bool>(
                             let async_lookp = async {
                                 loop {
                                     stream_rx.recv().await?;
-                                    let streams = read_entries(db.clone(), items).await?;
+                                    let streams = read_entries(db.clone(), &items).await?;
                                     if !streams.is_empty() {
                                         break anyhow::Result::<
                                                 Vec<(&String, Vec<StreamEntry>)>,
