@@ -443,29 +443,34 @@ async fn process_client_socket<const NOT_SLAVE: bool>(
                             debug!("blocking: {block_time}");
                             let mut stream_rx = stream_manager.stream_notify_tx.subscribe();
 
-                            let block_result = tokio::time::timeout(
-                                Duration::from_millis(*block_time as u64),
-                                async {
-                                    loop {
-                                        stream_rx.recv().await?;
-                                        let streams = read_entries(db.clone(), items).await?;
-                                        if !streams.is_empty() {
-                                            break anyhow::Result::<
-                                                    Vec<(&String, Vec<StreamEntry>)>,
-                                                >::Ok(
-                                                    streams
-                                                );
-                                        }
+                            let async_lookp = async {
+                                loop {
+                                    stream_rx.recv().await?;
+                                    let streams = read_entries(db.clone(), items).await?;
+                                    if !streams.is_empty() {
+                                        break anyhow::Result::<
+                                                Vec<(&String, Vec<StreamEntry>)>,
+                                            >::Ok(
+                                                streams
+                                            );
                                     }
-                                },
-                            )
-                            .await;
-                            match block_result {
-                                Ok(streams) => streams?,
-                                Err(_) => {
-                                    debug!("timeout");
-                                    vec![]
-                                } // timeout
+                                }
+                            };
+                            if *block_time == 0 {
+                                async_lookp.await?
+                            } else {
+                                let block_result = tokio::time::timeout(
+                                    Duration::from_millis(*block_time as u64),
+                                    async_lookp,
+                                )
+                                .await;
+                                match block_result {
+                                    Ok(streams) => streams?,
+                                    Err(_) => {
+                                        debug!("timeout");
+                                        vec![]
+                                    } // timeout
+                                }
                             }
                         } else {
                             streams
