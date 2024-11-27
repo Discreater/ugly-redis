@@ -46,14 +46,10 @@ pub enum ReqCommand {
         /// inclusive
         end_id: EntryId,
     },
-    XREAD(Vec<XReadItem>),
-}
-
-#[derive(Debug, Clone)]
-pub struct XReadItem {
-    pub stream_key: String,
-    /// exclusive
-    pub start: EntryId,
+    XREAD {
+        block_time: Option<usize>,
+        streams: Vec<XReadItem>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -61,6 +57,13 @@ pub enum ReplconfSubcommand {
     ListeningPort(u16),
     Capa(String),
     Getack,
+}
+
+#[derive(Debug, Clone)]
+pub struct XReadItem {
+    pub stream_key: String,
+    /// exclusive
+    pub start: EntryId,
 }
 
 #[derive(Debug, Clone)]
@@ -360,13 +363,31 @@ impl ReqCommand {
                     })
                 }
                 "XREAD" => {
-                    let sub = messages
+                    let mut sub_command = messages
                         .next()
                         .ok_or_else(|| ParseMessageError::expect("XREAD sub type"))?
                         .get_string()?;
-                    if sub != "streams" {
-                        unimplemented!("XREAD sub of: {sub}")
+                    let mut block_time = None;
+                    if sub_command == "block" {
+                        let time = messages
+                            .next()
+                            .ok_or_else(|| ParseMessageError::expect("XREAD block time"))?
+                            .get_string()?
+                            .parse()?;
+                        block_time.replace(time);
+                        sub_command = messages
+                            .next()
+                            .ok_or_else(|| ParseMessageError::expect("XREAD sub type"))?
+                            .get_string()?;
                     }
+
+                    if sub_command != "streams" {
+                        return Err(ParseMessageError::unsupported(format!(
+                            "sub command: {:?}",
+                            sub_command
+                        )));
+                    }
+
                     let messages: Vec<_> = messages.collect();
                     if messages.len() % 2 != 0 {
                         return Err(ParseMessageError::unsupported("XREAD items not even"));
@@ -391,7 +412,10 @@ impl ReqCommand {
                             start: s,
                         })
                         .collect();
-                    Ok(ReqCommand::XREAD(items))
+                    Ok(ReqCommand::XREAD {
+                        streams: items,
+                        block_time,
+                    })
                 }
                 _ => Err(ParseMessageError::unsupported(format!("command: {}", data))),
             },
@@ -695,12 +719,20 @@ impl From<ReqCommand> for Message {
                 Message::SimpleStrings(start_id.to_string()),
                 Message::SimpleStrings(end_id.to_string()),
             ]),
-            ReqCommand::XREAD(items) => {
-                let mut key_messages = Vec::with_capacity(items.len() * 2 + 2);
-                let mut start_messages = Vec::with_capacity(items.len());
+            ReqCommand::XREAD {
+                block_time,
+                streams,
+            } => {
+                let mut key_messages = Vec::with_capacity(streams.len() * 2 + 2);
+                let mut start_messages = Vec::with_capacity(streams.len());
                 key_messages.push(Message::SimpleStrings("XREAD".to_string()));
+                if let Some(block_time) = block_time {
+                    key_messages.push(Message::SimpleStrings("block".to_string()));
+                    key_messages.push(Message::SimpleStrings(block_time.to_string()));
+                }
+                
                 key_messages.push(Message::SimpleStrings("streams".to_string()));
-                for item in items {
+                for item in streams {
                     key_messages.push(Message::BulkStrings(Some(item.stream_key)));
                     start_messages.push(Message::SimpleStrings(item.start.to_string()));
                 }

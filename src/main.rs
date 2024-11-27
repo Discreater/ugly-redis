@@ -3,7 +3,7 @@ use futures_util::{SinkExt, StreamExt};
 use hex_literal::hex;
 use redis_starter_rust::{
     command::{ConfigSubCommand, ReplConfSubresponse, ReplconfSubcommand, ReqCommand, RespCommand},
-    db::{Db, EntryId, Value, ValueError},
+    db::{Db, StreamEntry, Value, ValueError},
     message::{Message, MessageFramer},
     rdb,
     replica::{ReplicaManager, ReplicaNotifyMessage},
@@ -17,10 +17,10 @@ use std::{
 use tokio::{
     net::{TcpListener, TcpStream},
     select,
-    sync::RwLock,
+    sync::{broadcast, RwLock},
 };
 use tokio_util::codec;
-use tracing::{error, info, trace, trace_span, warn, Instrument, Level};
+use tracing::{debug, error, info, trace, trace_span, warn, Instrument, Level};
 
 use clap::Parser;
 
@@ -75,17 +75,19 @@ async fn main() -> anyhow::Result<()> {
     let db = Arc::new(RwLock::new(db));
     let config = Arc::new(args);
 
+    let stream_manager = Arc::new(StreamManager::default());
     let replica_manager = Arc::new(ReplicaManager::default());
 
     if let Some(replicaof) = config.replicaof.clone() {
         let db = db.clone();
         let config = config.clone();
+        let stream_manager = stream_manager.clone();
         let replica_manager = replica_manager.clone();
         tokio::spawn(async move {
             let socket = handshake_with_master(replicaof, config.clone())
                 .await
                 .expect("handshake with master");
-            process_client_socket::<false>(socket, db, config, replica_manager)
+            process_client_socket::<false>(socket, db, config, stream_manager, replica_manager)
                 .await
                 .expect("process socket erorr");
         });
@@ -96,11 +98,12 @@ async fn main() -> anyhow::Result<()> {
         let addr = socket.peer_addr()?;
         let db = db.clone();
         let config = config.clone();
+        let stream_manager = stream_manager.clone();
         let state = replica_manager.clone();
         tokio::spawn(
             async move {
                 let socket = tokio_util::codec::Framed::new(socket, MessageFramer::default());
-                process_client_socket::<true>(socket, db, config, state)
+                process_client_socket::<true>(socket, db, config, stream_manager, state)
                     .await
                     .inspect_err(|e| error!("process socket error: {:?}", e))
                     .expect("process socket error")
@@ -186,6 +189,7 @@ async fn process_client_socket<const NOT_SLAVE: bool>(
     mut socket: codec::Framed<TcpStream, MessageFramer>,
     db: Arc<RwLock<Db>>,
     cfg: Arc<Args>,
+    stream_manager: Arc<StreamManager>,
     replica_manager: Arc<ReplicaManager>,
 ) -> anyhow::Result<()> {
     let mut received_bytes = 0;
@@ -370,6 +374,9 @@ async fn process_client_socket<const NOT_SLAVE: bool>(
                     };
                     match push_res {
                         Ok(id) => {
+                            if stream_manager.stream_notify_tx.receiver_count() != 0 {
+                                stream_manager.stream_notify_tx.send(())?;
+                            }
                             socket
                                 .send(RespCommand::Bulk(id.to_string()).into())
                                 .await?
@@ -396,28 +403,75 @@ async fn process_client_socket<const NOT_SLAVE: bool>(
                             .transpose()?
                             .unwrap_or_default()
                     };
+
                     socket
                         .send(RespCommand::StreamEntries(entries).into())
                         .await?;
                 }
             }
-            ReqCommand::XREAD(items) => {
+            ReqCommand::XREAD {
+                streams: items,
+                block_time,
+            } => {
+                async fn read_entries(
+                    db: Arc<RwLock<Db>>,
+                    items: &Vec<redis_starter_rust::command::XReadItem>,
+                ) -> anyhow::Result<Vec<(&String, Vec<StreamEntry>)>> {
+                    let db = db.read().await;
+                    Ok(items
+                        .iter()
+                        .map(|item| {
+                            let db_entry = db.kv.get(&item.stream_key);
+                            Ok((
+                                &item.stream_key,
+                                db_entry
+                                    .map(|entry| entry.xread(&item.start))
+                                    .transpose()?
+                                    .unwrap_or_default(),
+                            ))
+                        })
+                        .collect::<Result<Vec<_>, ValueError>>()?
+                        .into_iter()
+                        .filter(|(_, items)| !items.is_empty())
+                        .collect())
+                }
+
                 if NOT_SLAVE {
-                    let streams: Vec<_> = {
-                        let db = db.read().await;
-                        items
-                            .iter()
-                            .map(|item| {
-                                let db_entry = db.kv.get(&item.stream_key);
-                                Ok((
-                                    &item.stream_key,
-                                    db_entry
-                                        .map(|entry| entry.xrange(&item.start, &EntryId::MAX))
-                                        .transpose()?
-                                        .unwrap_or_default(),
-                                ))
-                            })
-                            .collect::<Result<_, ValueError>>()?
+                    let streams = read_entries(db.clone(), items).await?;
+                    let streams = if streams.is_empty() {
+                        if let Some(block_time) = block_time {
+                            debug!("blocking: {block_time}");
+                            let mut stream_rx = stream_manager.stream_notify_tx.subscribe();
+
+                            let block_result = tokio::time::timeout(
+                                Duration::from_millis(*block_time as u64),
+                                async {
+                                    loop {
+                                        stream_rx.recv().await?;
+                                        let streams = read_entries(db.clone(), items).await?;
+                                        if !streams.is_empty() {
+                                            break anyhow::Result::<
+                                                    Vec<(&String, Vec<StreamEntry>)>,
+                                                >::Ok(
+                                                    streams
+                                                );
+                                        }
+                                    }
+                                },
+                            )
+                            .await;
+                            match block_result {
+                                Ok(streams) => streams?,
+                                Err(_) => {
+                                    debug!("timeout");
+                                    vec![]
+                                } // timeout
+                            }
+                        } else {
+                            streams
+                        }
+                    } else {
+                        streams
                     };
                     let response = streams
                         .into_iter()
@@ -427,7 +481,11 @@ async fn process_client_socket<const NOT_SLAVE: bool>(
                             Message::Arrays(vec![stream_key, entries])
                         })
                         .collect::<Vec<_>>();
-                    socket.send(Message::Arrays(response)).await?;
+                    if response.is_empty() {
+                        socket.send(RespCommand::Nil.into()).await?;
+                    } else {
+                        socket.send(Message::Arrays(response)).await?;
+                    }
                 }
             }
             cmd => {
@@ -511,4 +569,17 @@ fn simple_pattern_match(pattern: &str, key: &str) -> bool {
         return key.starts_with(&pattern[..pattern.len() - 1]);
     }
     false
+}
+
+#[derive(Debug)]
+struct StreamManager {
+    stream_notify_tx: broadcast::Sender<()>,
+}
+
+impl Default for StreamManager {
+    fn default() -> Self {
+        Self {
+            stream_notify_tx: broadcast::Sender::new(64),
+        }
+    }
 }

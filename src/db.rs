@@ -100,6 +100,15 @@ impl Value {
         Ok(entries[start_pos..end_pos].to_vec())
     }
 
+    pub fn xread(&self, start: &EntryId) -> Result<Vec<StreamEntry>, ValueError> {
+        let entries = self.stream_entries()?;
+        let start_pos = match entries.binary_search_by_key(start, |e| e.id) {
+            Ok(i) => i + 1, // exclude `start``
+            Err(i) => i,
+        };
+        Ok(entries[start_pos..].to_vec())
+    }
+
     fn stream_entries(&self) -> Result<&Vec<StreamEntry>, ValueError> {
         match self {
             Value::Stream(entries) => Ok(entries),
@@ -141,6 +150,20 @@ impl EntryId {
 
     pub fn new(time: u64, seq: u64) -> Self {
         Self { time, seq }
+    }
+
+    pub fn next(&self) -> Self {
+        if self.seq == u64::MAX {
+            Self {
+                time: self.time + 1,
+                seq: self.seq,
+            }
+        } else {
+            Self {
+                time: self.time,
+                seq: self.seq + 1,
+            }
+        }
     }
 }
 
