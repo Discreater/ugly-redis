@@ -7,7 +7,7 @@ use redis_starter_rust::{
         XReadItem,
     },
     db::{Db, EntryId, StreamEntry, Value, ValueError},
-    message::{Message, MessageFramer},
+    message::{Message, MessageFramer, RespError},
     rdb,
     replica::{ReplicaManager, ReplicaNotifyMessage},
 };
@@ -196,6 +196,7 @@ async fn process_client_socket<const NOT_SLAVE: bool>(
     replica_manager: Arc<ReplicaManager>,
 ) -> anyhow::Result<()> {
     let mut received_bytes = 0;
+    let mut in_transaction = false;
     while let Some(message) = socket.next().await {
         trace!("received message: {:?}", message);
         let (message, message_bytes) = message?;
@@ -530,7 +531,18 @@ async fn process_client_socket<const NOT_SLAVE: bool>(
             }
             ReqCommand::Multi => {
                 if NOT_SLAVE {
+                    in_transaction = true;
                     socket.send(RespCommand::Ok.into()).await?;
+                }
+            }
+            ReqCommand::Exec => {
+                if NOT_SLAVE {
+                    if in_transaction {
+                        in_transaction = false;
+                        socket.send(RespCommand::Ok.into()).await?;
+                    } else {
+                        socket.send(RespError::ExecWithoutMulti.into()).await?;
+                    }
                 }
             }
             cmd => {

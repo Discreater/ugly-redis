@@ -15,8 +15,15 @@ pub enum RespError {
     StreamEntryIdZero,
     #[error("ERR value is not an integer or out of range")]
     IncrValueNotInteger,
+    #[error("ERR EXEC without MULTI")]
+    ExecWithoutMulti,
 }
 
+impl From<RespError> for Message {
+    fn from(value: RespError) -> Self {
+        Message::SimpleErrors(value.to_string())
+    }
+}
 #[derive(Debug, PartialEq, Clone)]
 pub enum Message {
     // RESP2 	Simple 	+
