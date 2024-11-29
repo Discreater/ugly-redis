@@ -434,7 +434,7 @@ impl ReqCommand {
                         .get_string()?;
                     Ok(ReqCommand::Incr(key))
                 }
-                "Multi" => Ok(ReqCommand::Multi),
+                "MULTI" => Ok(ReqCommand::Multi),
                 _ => Err(ParseMessageError::unsupported(format!("command: {}", data))),
             },
             Err(message) => Err(ParseMessageError::unsupported(format!(
