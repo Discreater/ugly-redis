@@ -196,12 +196,19 @@ async fn process_client_socket<const NOT_SLAVE: bool>(
     replica_manager: Arc<ReplicaManager>,
 ) -> anyhow::Result<()> {
     let mut received_bytes = 0;
-    let mut in_transaction = false;
+    let mut transaction: Option<Vec<ReqCommand>> = None;
     while let Some(message) = socket.next().await {
         trace!("received message: {:?}", message);
         let (message, message_bytes) = message?;
         let req_command = message.parse_req()?;
         info!("parsed command: {:?}", req_command);
+        if let Some(transaction) = transaction.as_mut() {
+            if !matches!(req_command, ReqCommand::Exec) {
+                transaction.push(req_command.clone());
+                socket.send(RespCommand::Simple("QUEUED").into()).await?;
+                continue;
+            }
+        }
         match &req_command {
             ReqCommand::Ping => {
                 if NOT_SLAVE {
@@ -531,14 +538,14 @@ async fn process_client_socket<const NOT_SLAVE: bool>(
             }
             ReqCommand::Multi => {
                 if NOT_SLAVE {
-                    in_transaction = true;
+                    transaction.replace(vec![]);
                     socket.send(RespCommand::Ok.into()).await?;
                 }
             }
             ReqCommand::Exec => {
                 if NOT_SLAVE {
-                    if in_transaction {
-                        in_transaction = false;
+                    if let Some(_ransaction) = transaction.take() {
+                        // todo!();
                         socket.send(Message::Arrays(vec![])).await?;
                     } else {
                         socket.send(RespError::ExecWithoutMulti.into()).await?;
