@@ -518,9 +518,15 @@ async fn process_client_socket<const NOT_SLAVE: bool>(
                 let value = {
                     let mut db = db.write().await;
                     let value = db.kv.entry(key.clone()).or_insert(Value::Integer(0));
-                    value.incr()?
+                    value.incr()
                 };
-                socket.send(RespCommand::Int(value).into()).await?;
+                match value {
+                    Ok(value) => socket.send(RespCommand::Int(value).into()).await?,
+                    Err(ValueError::RespError(resp)) => {
+                        socket.send(Message::SimpleErrors(resp.to_string())).await?
+                    }
+                    Err(e) => return Err(e.into()),
+                }
             }
             cmd => {
                 error!("unsupported command: {:?}", cmd);

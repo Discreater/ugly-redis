@@ -13,6 +13,8 @@ pub enum RespError {
     StreamEntryIdDecrease,
     #[error("ERR The ID specified in XADD must be greater than 0-0")]
     StreamEntryIdZero,
+    #[error("ERR value is not an integer or out of range")]
+    IncrValueNotInteger,
 }
 
 #[derive(Debug, PartialEq, Clone)]

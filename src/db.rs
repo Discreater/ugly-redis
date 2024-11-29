@@ -123,10 +123,7 @@ impl Value {
     pub fn incr(&mut self) -> Result<i64, ValueError> {
         match self {
             Value::String(s) => {
-                let v: i64 = s.parse().map_err(|_| ValueError::TypeError {
-                    expect: "integer".to_string(),
-                    got: s.to_string(),
-                })?;
+                let v: i64 = s.parse().map_err(|_| RespError::IncrValueNotInteger)?;
                 let v = v + 1;
                 *self = Value::Integer(v);
                 Ok(v)
@@ -135,10 +132,7 @@ impl Value {
                 *i += 1;
                 Ok(*i)
             }
-            _ => Err(ValueError::TypeError {
-                expect: "String".to_string(),
-                got: self.ty().to_string(),
-            }),
+            _ => Err(RespError::IncrValueNotInteger.into()),
         }
     }
 
