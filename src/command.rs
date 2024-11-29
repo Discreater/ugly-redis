@@ -50,6 +50,7 @@ pub enum ReqCommand {
         block_time: Option<usize>,
         streams: Vec<XReadItemRaw>,
     },
+    Incr(String),
 }
 
 #[derive(Debug, Clone)]
@@ -93,6 +94,7 @@ impl From<Value> for RespCommand {
     fn from(value: Value) -> Self {
         match value {
             Value::String(s) => RespCommand::Bulk(s),
+            Value::Integer(i) => RespCommand::Bulk(i.to_string()),
             _ => unimplemented!(),
         }
     }
@@ -424,6 +426,13 @@ impl ReqCommand {
                         block_time,
                     })
                 }
+                "INCR" => {
+                    let key = messages
+                        .next()
+                        .ok_or_else(|| ParseMessageError::expect("INCR key"))?
+                        .get_string()?;
+                    Ok(ReqCommand::Incr(key))
+                }
                 _ => Err(ParseMessageError::unsupported(format!("command: {}", data))),
             },
             Err(message) => Err(ParseMessageError::unsupported(format!(
@@ -722,6 +731,10 @@ impl From<ReqCommand> for Message {
                 key_messages.extend(start_messages);
                 Message::Arrays(key_messages)
             }
+            ReqCommand::Incr(key) => Message::Arrays(vec![
+                Message::SimpleStrings("INCR".to_string()),
+                Message::BulkStrings(Some(key)),
+            ]),
         }
     }
 }

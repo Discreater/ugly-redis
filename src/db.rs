@@ -17,6 +17,7 @@ pub struct Db {
 #[derive(Clone, Debug)]
 pub enum Value {
     String(String),
+    Integer(i64),
     List,
     Set,
     ZSet,
@@ -119,12 +120,30 @@ impl Value {
         Ok(entries[start_pos..].to_vec())
     }
 
+    pub fn incr(&mut self) -> Result<i64, ValueError> {
+        match self {
+            Value::String(s) => {
+                let v: i64 = s.parse().map_err(|_| ValueError::TypeError {
+                    expect: "integer".to_string(),
+                    got: s.to_string(),
+                })?;
+                let v = v + 1;
+                *self = Value::Integer(v);
+                Ok(v)
+            }
+            _ => Err(ValueError::TypeError {
+                expect: "String".to_string(),
+                got: self.ty().to_string(),
+            }),
+        }
+    }
+
     fn stream_entries(&self) -> Result<&Vec<StreamEntry>, ValueError> {
         match self {
             Value::Stream(entries) => Ok(entries),
             _ => Err(ValueError::TypeError {
                 expect: "stream".to_string(),
-                got: Value::ty(Some(self)).to_string(),
+                got: self.ty().to_string(),
             }),
         }
     }
@@ -133,7 +152,7 @@ impl Value {
             Value::Stream(entries) => Ok(entries),
             _ => Err(ValueError::TypeError {
                 expect: "stream".to_string(),
-                got: Value::ty(Some(self)).to_string(),
+                got: self.ty().to_string(),
             }),
         }
     }
@@ -236,14 +255,21 @@ impl PartialOrd for StreamEntry {
 }
 
 impl Value {
-    pub fn ty(v: Option<&Self>) -> &'static str {
+    pub fn ty(&self) -> &'static str {
+        match self {
+            Value::String(_) => "string",
+            Value::List => "list",
+            Value::Set => "set",
+            Value::ZSet => "zset",
+            Value::Hash => "hash",
+            Value::Stream(_) => "stream",
+            Value::Integer(_) => "string",
+        }
+    }
+
+    pub fn tyn(v: Option<&Self>) -> &'static str {
         match v {
-            Some(Value::String(_)) => "string",
-            Some(Value::List) => "list",
-            Some(Value::Set) => "set",
-            Some(Value::ZSet) => "zset",
-            Some(Value::Hash) => "hash",
-            Some(Value::Stream(_)) => "stream",
+            Some(v) => v.ty(),
             None => "none",
         }
     }

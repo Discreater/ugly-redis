@@ -356,7 +356,7 @@ async fn process_client_socket<const NOT_SLAVE: bool>(
                 if NOT_SLAVE {
                     let ty = {
                         let db = db.read().await;
-                        Value::ty(db.kv.get(key))
+                        Value::tyn(db.kv.get(key))
                     };
                     socket.send(RespCommand::Simple(ty).into()).await?
                 }
@@ -513,6 +513,14 @@ async fn process_client_socket<const NOT_SLAVE: bool>(
                         socket.send(Message::Arrays(response)).await?;
                     }
                 }
+            }
+            ReqCommand::Incr(key) => {
+                let value = {
+                    let mut db = db.write().await;
+                    let value = db.kv.entry(key.clone()).or_insert(Value::Integer(0));
+                    value.incr()?
+                };
+                socket.send(RespCommand::Int(value).into()).await?;
             }
             cmd => {
                 error!("unsupported command: {:?}", cmd);
