@@ -131,6 +131,10 @@ impl Value {
                 *self = Value::Integer(v);
                 Ok(v)
             }
+            Value::Integer(i) => {
+                *i += 1;
+                Ok(*i)
+            }
             _ => Err(ValueError::TypeError {
                 expect: "String".to_string(),
                 got: self.ty().to_string(),
