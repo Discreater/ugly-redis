@@ -539,7 +539,7 @@ async fn process_client_socket<const NOT_SLAVE: bool>(
                 if NOT_SLAVE {
                     if in_transaction {
                         in_transaction = false;
-                        socket.send(RespCommand::Ok.into()).await?;
+                        socket.send(Message::Arrays(vec![])).await?;
                     } else {
                         socket.send(RespError::ExecWithoutMulti.into()).await?;
                     }
