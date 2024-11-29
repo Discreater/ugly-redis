@@ -51,6 +51,7 @@ pub enum ReqCommand {
         streams: Vec<XReadItemRaw>,
     },
     Incr(String),
+    Multi,
 }
 
 #[derive(Debug, Clone)]
@@ -433,6 +434,7 @@ impl ReqCommand {
                         .get_string()?;
                     Ok(ReqCommand::Incr(key))
                 }
+                "Multi" => Ok(ReqCommand::Multi),
                 _ => Err(ParseMessageError::unsupported(format!("command: {}", data))),
             },
             Err(message) => Err(ParseMessageError::unsupported(format!(
@@ -735,6 +737,7 @@ impl From<ReqCommand> for Message {
                 Message::SimpleStrings("INCR".to_string()),
                 Message::BulkStrings(Some(key)),
             ]),
+            ReqCommand::Multi => Message::Arrays(vec![Message::SimpleStrings("Multi".to_string())]),
         }
     }
 }

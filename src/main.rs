@@ -528,6 +528,11 @@ async fn process_client_socket<const NOT_SLAVE: bool>(
                     Err(e) => return Err(e.into()),
                 }
             }
+            ReqCommand::Multi => {
+                if NOT_SLAVE {
+                    socket.send(RespCommand::Ok.into()).await?;
+                }
+            }
             cmd => {
                 error!("unsupported command: {:?}", cmd);
             }
