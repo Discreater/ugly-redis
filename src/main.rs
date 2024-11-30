@@ -97,8 +97,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     loop {
-        let (socket, _) = listener.accept().await?;
-        let addr = socket.peer_addr()?;
+        let (socket, addr) = listener.accept().await?;
         let db = db.clone();
         let config = config.clone();
         let stream_manager = stream_manager.clone();
