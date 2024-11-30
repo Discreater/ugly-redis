@@ -14,6 +14,7 @@ use redis_starter_rust::{
 use std::{
     collections::HashMap,
     net::{Ipv4Addr, SocketAddrV4},
+    ops::ControlFlow,
     sync::Arc,
     time::{Duration, UNIX_EPOCH},
 };
@@ -188,6 +189,12 @@ async fn handshake_with_master(
     Ok(master)
 }
 
+#[derive(Default)]
+struct RedisContext {
+    received_bytes: usize,
+    transaction: Option<Vec<(ReqCommand, usize)>>,
+}
+
 async fn process_client_socket<const NOT_SLAVE: bool>(
     mut socket: codec::Framed<TcpStream, MessageFramer>,
     db: Arc<RwLock<Db>>,
@@ -195,375 +202,388 @@ async fn process_client_socket<const NOT_SLAVE: bool>(
     stream_manager: Arc<StreamManager>,
     replica_manager: Arc<ReplicaManager>,
 ) -> anyhow::Result<()> {
-    let mut received_bytes = 0;
-    let mut transaction: Option<Vec<ReqCommand>> = None;
+    let mut ctx = RedisContext::default();
     while let Some(message) = socket.next().await {
         trace!("received message: {:?}", message);
         let (message, message_bytes) = message?;
         let req_command = message.parse_req()?;
         info!("parsed command: {:?}", req_command);
-        if let Some(transaction) = transaction.as_mut() {
-            if !matches!(req_command, ReqCommand::Exec) {
-                transaction.push(req_command.clone());
-                socket.send(RespCommand::Simple("QUEUED").into()).await?;
+
+        if matches!(req_command, ReqCommand::Exec) {
+            let Some(transaction) = ctx.transaction.take() else {
+                socket.send(RespError::ExecWithoutMulti.into()).await?;
                 continue;
+            };
+            let mut responds = Vec::with_capacity(transaction.len());
+            for (cmd, bytes) in transaction {
+                let message = respond_to::<NOT_SLAVE>(
+                    &cmd,
+                    &mut socket,
+                    &db,
+                    &cfg,
+                    &stream_manager,
+                    &replica_manager,
+                    &mut ctx,
+                )
+                .await?
+                .unwrap_or(RespCommand::Nil.into());
+                ctx.received_bytes += bytes;
+                responds.push(message);
             }
+            socket.send(Message::Arrays(responds)).await?;
+            ctx.received_bytes += message_bytes;
+            continue;
         }
-        match &req_command {
-            ReqCommand::Ping => {
-                if NOT_SLAVE {
-                    socket.send(RespCommand::Pong.into()).await?;
-                }
-            }
-            ReqCommand::Echo(data) => {
-                if NOT_SLAVE {
-                    socket.send(RespCommand::Bulk(data.clone()).into()).await?;
-                }
-            }
-            ReqCommand::Get(key) => {
-                let (value, expire) = {
-                    let db = db.read().await;
-                    (db.kv.get(key).cloned(), db.expire.get(key).cloned())
-                };
-                let value = if let Some(value) = value {
-                    if let Some(expire) = expire {
-                        if UNIX_EPOCH + Duration::from_millis(expire) < std::time::SystemTime::now()
-                        {
-                            RespCommand::Nil
-                        } else {
-                            value.into()
-                        }
-                    } else {
-                        value.into()
-                    }
-                } else {
-                    RespCommand::Nil
-                };
-                if NOT_SLAVE {
-                    socket.send(value.into()).await?;
-                }
-            }
-            ReqCommand::Set { key, value, px } => {
-                replica_manager
-                    .notify(req_command.clone())
-                    .await
-                    .context("notify message to replica error")?;
-                let expired_time = px.and_then(|px| {
-                    (std::time::SystemTime::now() + px)
-                        .duration_since(UNIX_EPOCH)
-                        .ok()
-                        .map(|d| d.as_millis() as u64)
-                });
-                {
-                    let mut db = db.write().await;
-                    db.kv.insert(key.clone(), Value::String(value.clone()));
 
-                    if let Some(expired_time) = expired_time {
-                        db.expire.insert(key.clone(), expired_time);
-                    } else {
-                        db.expire.remove_entry(key);
-                    }
-                }
-                if NOT_SLAVE {
-                    socket.send(RespCommand::Simple("OK").into()).await?;
-                }
-            }
-            ReqCommand::Config(ConfigSubCommand::GET(key)) => {
-                let value = match key.as_str() {
-                    "dir" => cfg.dir.clone(),
-                    "dbfilename" => cfg.dbfilename.clone(),
-                    _ => None,
-                };
-                if NOT_SLAVE {
-                    socket
-                        .send(RespCommand::Bulks(vec![Some(key.clone()), value]).into())
-                        .await?;
-                }
-            }
-            ReqCommand::KEYS(pattern) => {
-                let keys = {
-                    let db = db.read().await;
-                    db.kv.keys().cloned().collect::<Vec<String>>()
-                };
-                let keys = keys
-                    .into_iter()
-                    .filter(|key| simple_pattern_match(&pattern, key))
-                    .map(Option::Some)
-                    .collect();
-                if NOT_SLAVE {
-                    socket.send(RespCommand::Bulks(keys).into()).await?;
-                }
-            }
-            ReqCommand::Info(section) => match section.as_ref().map(|s| s.as_str()) {
-                Some("replication") => {
-                    let info = replication_info(&cfg)
-                        .into_iter()
-                        .map(|(k, v)| format!("{}:{}", k, v))
-                        .collect::<Vec<String>>()
-                        .join("\r\n");
-                    socket.send(RespCommand::Bulk(info).into()).await?;
-                }
-                None => {
-                    let info = all_info(&cfg)
-                        .into_iter()
-                        .map(|(k, v)| format!("{}:{}", k, v))
-                        .collect::<Vec<String>>()
-                        .join("\r\n");
-                    socket.send(RespCommand::Bulk(info).into()).await?;
-                }
-                s => {
-                    error!("unsupported INFO section: {:?}", s);
-                }
-            },
-            ReqCommand::Replconf(subc) => {
-                if NOT_SLAVE {
-                    socket.send(RespCommand::Ok.into()).await?;
-                } else {
-                    match subc {
-                        ReplconfSubcommand::Getack => {
-                            socket
-                                .send(
-                                    RespCommand::Replconf(ReplConfSubresponse::Ack(received_bytes))
-                                        .into(),
-                                )
-                                .await?;
-                        }
-                        _ => warn!("only response getack when in replica mode"),
-                    }
-                }
-            }
-            ReqCommand::Psync { .. } => {
-                socket
-                    .send(
-                        RespCommand::FullResync {
-                            repl_id: REPLICATION_ID.to_string(),
-                            offset: 0,
-                        }
-                        .into(),
-                    )
-                    .await?;
-                socket
-                    .send(RespCommand::RdbFile(EMPTY_RDB_CONTENT.to_vec()).into())
-                    .await?;
-
-                return process_replica_socket(socket, replica_manager).await;
-            }
-            ReqCommand::Wait {
-                number_replicas,
-                time_out,
-            } => {
-                if NOT_SLAVE {
-                    // replica number is assert to small than i64::max;
-                    let replicas = replica_manager.wait(*number_replicas, *time_out).await?;
-                    socket
-                        .send(RespCommand::Int(replicas as i64).into())
-                        .await?;
-                }
-            }
-            ReqCommand::Type(key) => {
-                if NOT_SLAVE {
-                    let ty = {
-                        let db = db.read().await;
-                        Value::tyn(db.kv.get(key))
-                    };
-                    socket.send(RespCommand::Simple(ty).into()).await?
-                }
-            }
-            ReqCommand::XADD {
-                stream_key,
-                entry_id,
-                pairs,
-            } => {
-                if NOT_SLAVE {
-                    let push_res = {
-                        let mut db = db.write().await;
-                        let db_entry = db
-                            .kv
-                            .entry(stream_key.clone())
-                            .or_insert_with(|| Value::Stream(vec![]));
-                        db_entry.push_stream_entry(&entry_id, pairs.clone())
-                    };
-                    match push_res {
-                        Ok(id) => {
-                            if stream_manager.stream_notify_tx.receiver_count() != 0 {
-                                stream_manager.stream_notify_tx.send(())?;
-                            }
-                            socket
-                                .send(RespCommand::Bulk(id.to_string()).into())
-                                .await?
-                        }
-                        Err(ValueError::RespError(resp)) => {
-                            warn!("{resp}");
-                            socket.send(Message::SimpleErrors(resp.to_string())).await?
-                        }
-                        Err(e) => return Err(e.into()),
-                    }
-                }
-            }
-            ReqCommand::XRANGE {
-                stream_key,
-                start_id,
-                end_id,
-            } => {
-                if NOT_SLAVE {
-                    let entries = {
-                        let db = db.read().await;
-                        let db_entry = db.kv.get(stream_key);
-                        db_entry
-                            .map(|entry| entry.xrange(start_id, end_id))
-                            .transpose()?
-                            .unwrap_or_default()
-                    };
-
-                    socket
-                        .send(RespCommand::StreamEntries(entries).into())
-                        .await?;
-                }
-            }
-            ReqCommand::XREAD {
-                streams: items,
-                block_time,
-            } => {
-                async fn read_entries(
-                    db: Arc<RwLock<Db>>,
-                    items: &Vec<redis_starter_rust::command::XReadItem>,
-                ) -> anyhow::Result<Vec<(&String, Vec<StreamEntry>)>> {
-                    let db = db.read().await;
-                    Ok(items
-                        .iter()
-                        .map(|item| {
-                            let db_entry = db.kv.get(&item.stream_key);
-                            Ok((
-                                &item.stream_key,
-                                db_entry
-                                    .map(|entry: &Value| entry.xread(&item.start))
-                                    .transpose()?
-                                    .unwrap_or_default(),
-                            ))
-                        })
-                        .collect::<Result<Vec<_>, ValueError>>()?
-                        .into_iter()
-                        .filter(|(_, items)| !items.is_empty())
-                        .collect())
-                }
-
-                if NOT_SLAVE {
-                    let items = {
-                        let db = db.read().await;
-                        items
-                            .iter()
-                            .map(|item| {
-                                let id = db
-                                    .kv
-                                    .get(&item.stream_key)
-                                    .map(|entry| entry.map_xread_raw(&item.start))
-                                    .transpose()?
-                                    .unwrap_or(EntryId::ZERO);
-                                Ok(XReadItem {
-                                    stream_key: item.stream_key.clone(),
-                                    start: id,
-                                })
-                            })
-                            .collect::<Result<_, ValueError>>()?
-                    };
-                    let streams = read_entries(db.clone(), &items).await?;
-                    let streams = if streams.is_empty() {
-                        if let Some(block_time) = block_time {
-                            debug!("blocking: {block_time}");
-                            let mut stream_rx = stream_manager.stream_notify_tx.subscribe();
-
-                            let async_lookp = async {
-                                loop {
-                                    stream_rx.recv().await?;
-                                    let streams = read_entries(db.clone(), &items).await?;
-                                    if !streams.is_empty() {
-                                        break anyhow::Result::<
-                                                Vec<(&String, Vec<StreamEntry>)>,
-                                            >::Ok(
-                                                streams
-                                            );
-                                    }
-                                }
-                            };
-                            if *block_time == 0 {
-                                async_lookp.await?
-                            } else {
-                                let block_result = tokio::time::timeout(
-                                    Duration::from_millis(*block_time as u64),
-                                    async_lookp,
-                                )
-                                .await;
-                                match block_result {
-                                    Ok(streams) => streams?,
-                                    Err(_) => {
-                                        debug!("timeout");
-                                        vec![]
-                                    } // timeout
-                                }
-                            }
-                        } else {
-                            streams
-                        }
-                    } else {
-                        streams
-                    };
-                    let response = streams
-                        .into_iter()
-                        .map(|(key, entries)| {
-                            let stream_key = Message::BulkStrings(Some(key.clone()));
-                            let entries = Message::from(RespCommand::StreamEntries(entries));
-                            Message::Arrays(vec![stream_key, entries])
-                        })
-                        .collect::<Vec<_>>();
-                    if response.is_empty() {
-                        socket.send(RespCommand::Nil.into()).await?;
-                    } else {
-                        socket.send(Message::Arrays(response)).await?;
-                    }
-                }
-            }
-            ReqCommand::Incr(key) => {
-                let value = {
-                    let mut db = db.write().await;
-                    let value = db.kv.entry(key.clone()).or_insert(Value::Integer(0));
-                    value.incr()
-                };
-                match value {
-                    Ok(value) => socket.send(RespCommand::Int(value).into()).await?,
-                    Err(ValueError::RespError(resp)) => {
-                        socket.send(Message::SimpleErrors(resp.to_string())).await?
-                    }
-                    Err(e) => return Err(e.into()),
-                }
-            }
-            ReqCommand::Multi => {
-                if NOT_SLAVE {
-                    transaction.replace(vec![]);
-                    socket.send(RespCommand::Ok.into()).await?;
-                }
-            }
-            ReqCommand::Exec => {
-                if NOT_SLAVE {
-                    if let Some(_ransaction) = transaction.take() {
-                        // todo!();
-                        socket.send(Message::Arrays(vec![])).await?;
-                    } else {
-                        socket.send(RespError::ExecWithoutMulti.into()).await?;
-                    }
-                }
-            }
-            cmd => {
-                error!("unsupported command: {:?}", cmd);
-            }
+        if let Some(transaction) = ctx.transaction.as_mut() {
+            transaction.push((req_command.clone(), message_bytes));
+            socket.send(RespCommand::Simple("QUEUED").into()).await?;
+            continue;
         }
-        received_bytes += message_bytes;
+        let message = respond_to::<NOT_SLAVE>(
+            &req_command,
+            &mut socket,
+            &db,
+            &cfg,
+            &stream_manager,
+            &replica_manager,
+            &mut ctx,
+        )
+        .await?;
+
+        ctx.received_bytes += message_bytes;
+
+        let Some(message) = message else {
+            continue;
+        };
+        if NOT_SLAVE {
+            socket.send(message).await?;
+        }
     }
     Ok(())
 }
 
+async fn respond_to<const NOT_SLAVE: bool>(
+    req_command: &ReqCommand,
+    socket: &mut codec::Framed<TcpStream, MessageFramer>,
+    db: &RwLock<Db>,
+    cfg: &Args,
+    stream_manager: &StreamManager,
+    replica_manager: &ReplicaManager,
+    ctx: &mut RedisContext,
+) -> anyhow::Result<Option<Message>> {
+    let message: Message = match &req_command {
+        ReqCommand::Ping => RespCommand::Pong.into(),
+        ReqCommand::Echo(data) => RespCommand::Bulk(data.clone()).into(),
+        ReqCommand::Get(key) => {
+            let (value, expire) = {
+                let db = db.read().await;
+                (db.kv.get(key).cloned(), db.expire.get(key).cloned())
+            };
+            let value = if let Some(value) = value {
+                if let Some(expire) = expire {
+                    if UNIX_EPOCH + Duration::from_millis(expire) < std::time::SystemTime::now() {
+                        RespCommand::Nil
+                    } else {
+                        value.into()
+                    }
+                } else {
+                    value.into()
+                }
+            } else {
+                RespCommand::Nil
+            };
+            value.into()
+        }
+        ReqCommand::Set { key, value, px } => {
+            replica_manager
+                .notify(req_command.clone())
+                .await
+                .context("notify message to replica error")?;
+            let expired_time = px.and_then(|px| {
+                (std::time::SystemTime::now() + px)
+                    .duration_since(UNIX_EPOCH)
+                    .ok()
+                    .map(|d| d.as_millis() as u64)
+            });
+            {
+                let mut db = db.write().await;
+                db.kv.insert(key.clone(), Value::String(value.clone()));
+
+                if let Some(expired_time) = expired_time {
+                    db.expire.insert(key.clone(), expired_time);
+                } else {
+                    db.expire.remove_entry(key);
+                }
+            }
+            RespCommand::Simple("OK").into()
+        }
+        ReqCommand::Config(ConfigSubCommand::GET(key)) => {
+            let value = match key.as_str() {
+                "dir" => cfg.dir.clone(),
+                "dbfilename" => cfg.dbfilename.clone(),
+                _ => None,
+            };
+            RespCommand::Bulks(vec![Some(key.clone()), value]).into()
+        }
+        ReqCommand::KEYS(pattern) => {
+            let keys = {
+                let db = db.read().await;
+                db.kv.keys().cloned().collect::<Vec<String>>()
+            };
+            let keys = keys
+                .into_iter()
+                .filter(|key| simple_pattern_match(&pattern, key))
+                .map(Option::Some)
+                .collect();
+            RespCommand::Bulks(keys).into()
+        }
+        ReqCommand::Info(section) => match section.as_ref().map(|s| s.as_str()) {
+            Some("replication") => {
+                let info = replication_info(cfg)
+                    .into_iter()
+                    .map(|(k, v)| format!("{}:{}", k, v))
+                    .collect::<Vec<String>>()
+                    .join("\r\n");
+                RespCommand::Bulk(info).into()
+            }
+            None => {
+                let info = all_info(&cfg)
+                    .into_iter()
+                    .map(|(k, v)| format!("{}:{}", k, v))
+                    .collect::<Vec<String>>()
+                    .join("\r\n");
+                RespCommand::Bulk(info).into()
+            }
+            s => {
+                error!("unsupported INFO section: {:?}", s);
+                return Ok(None);
+            }
+        },
+        ReqCommand::Replconf(subc) => {
+            if NOT_SLAVE {
+                RespCommand::Ok.into()
+            } else {
+                match subc {
+                    ReplconfSubcommand::Getack => {
+                        socket
+                            .send(
+                                RespCommand::Replconf(ReplConfSubresponse::Ack(ctx.received_bytes))
+                                    .into(),
+                            )
+                            .await?;
+                    }
+                    _ => warn!("only response getack when in replica mode"),
+                }
+                return Ok(None);
+            }
+        }
+        ReqCommand::Psync { .. } => {
+            socket
+                .send(
+                    RespCommand::FullResync {
+                        repl_id: REPLICATION_ID.to_string(),
+                        offset: 0,
+                    }
+                    .into(),
+                )
+                .await?;
+            socket
+                .send(RespCommand::RdbFile(EMPTY_RDB_CONTENT.to_vec()).into())
+                .await?;
+
+            return process_replica_socket(socket, replica_manager)
+                .await
+                .map(|_| None);
+        }
+        ReqCommand::Wait {
+            number_replicas,
+            time_out,
+        } => {
+            // replica number is assert to small than i64::max;
+            let replicas = replica_manager.wait(*number_replicas, *time_out).await?;
+            RespCommand::Int(replicas as i64).into()
+        }
+        ReqCommand::Type(key) => {
+            let ty = {
+                let db = db.read().await;
+                Value::tyn(db.kv.get(key))
+            };
+            RespCommand::Simple(ty).into()
+        }
+        ReqCommand::XADD {
+            stream_key,
+            entry_id,
+            pairs,
+        } => {
+            let push_res = {
+                let mut db = db.write().await;
+                let db_entry = db
+                    .kv
+                    .entry(stream_key.clone())
+                    .or_insert_with(|| Value::Stream(vec![]));
+                db_entry.push_stream_entry(&entry_id, pairs.clone())
+            };
+            match push_res {
+                Ok(id) => {
+                    if stream_manager.stream_notify_tx.receiver_count() != 0 {
+                        stream_manager.stream_notify_tx.send(())?;
+                    }
+                    RespCommand::Bulk(id.to_string()).into()
+                }
+                Err(ValueError::RespError(resp)) => {
+                    warn!("{resp}");
+                    Message::SimpleErrors(resp.to_string())
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+        ReqCommand::XRANGE {
+            stream_key,
+            start_id,
+            end_id,
+        } => {
+            let entries = {
+                let db = db.read().await;
+                let db_entry = db.kv.get(stream_key);
+                db_entry
+                    .map(|entry| entry.xrange(start_id, end_id))
+                    .transpose()?
+                    .unwrap_or_default()
+            };
+
+            RespCommand::StreamEntries(entries).into()
+        }
+        ReqCommand::XREAD {
+            streams: items,
+            block_time,
+        } => {
+            async fn read_entries<'items>(
+                db: &RwLock<Db>,
+                items: &'items Vec<redis_starter_rust::command::XReadItem>,
+            ) -> anyhow::Result<Vec<(&'items String, Vec<StreamEntry>)>> {
+                let db = db.read().await;
+                Ok(items
+                    .iter()
+                    .map(|item| {
+                        let db_entry = db.kv.get(&item.stream_key);
+                        Ok((
+                            &item.stream_key,
+                            db_entry
+                                .map(|entry: &Value| entry.xread(&item.start))
+                                .transpose()?
+                                .unwrap_or_default(),
+                        ))
+                    })
+                    .collect::<Result<Vec<_>, ValueError>>()?
+                    .into_iter()
+                    .filter(|(_, items)| !items.is_empty())
+                    .collect())
+            }
+
+            let items = {
+                let db = db.read().await;
+                items
+                    .iter()
+                    .map(|item| {
+                        let id = db
+                            .kv
+                            .get(&item.stream_key)
+                            .map(|entry| entry.map_xread_raw(&item.start))
+                            .transpose()?
+                            .unwrap_or(EntryId::ZERO);
+                        Ok(XReadItem {
+                            stream_key: item.stream_key.clone(),
+                            start: id,
+                        })
+                    })
+                    .collect::<Result<_, ValueError>>()?
+            };
+            let streams = read_entries(db, &items).await?;
+            let streams = if streams.is_empty() {
+                if let Some(block_time) = block_time {
+                    debug!("blocking: {block_time}");
+                    let mut stream_rx = stream_manager.stream_notify_tx.subscribe();
+
+                    let async_lookp = async {
+                        loop {
+                            stream_rx.recv().await?;
+                            let streams = read_entries(db, &items).await?;
+                            if !streams.is_empty() {
+                                break anyhow::Result::<Vec<(&String, Vec<StreamEntry>)>>::Ok(
+                                    streams,
+                                );
+                            }
+                        }
+                    };
+                    if *block_time == 0 {
+                        async_lookp.await?
+                    } else {
+                        let block_result = tokio::time::timeout(
+                            Duration::from_millis(*block_time as u64),
+                            async_lookp,
+                        )
+                        .await;
+                        match block_result {
+                            Ok(streams) => streams?,
+                            Err(_) => {
+                                debug!("timeout");
+                                vec![]
+                            } // timeout
+                        }
+                    }
+                } else {
+                    streams
+                }
+            } else {
+                streams
+            };
+            let response = streams
+                .into_iter()
+                .map(|(key, entries)| {
+                    let stream_key = Message::BulkStrings(Some(key.clone()));
+                    let entries = Message::from(RespCommand::StreamEntries(entries));
+                    Message::Arrays(vec![stream_key, entries])
+                })
+                .collect::<Vec<_>>();
+            if response.is_empty() {
+                RespCommand::Nil.into()
+            } else {
+                Message::Arrays(response)
+            }
+        }
+        ReqCommand::Incr(key) => {
+            let value = {
+                let mut db = db.write().await;
+                let value = db.kv.entry(key.clone()).or_insert(Value::Integer(0));
+                value.incr()
+            };
+            match value {
+                Ok(value) => RespCommand::Int(value).into(),
+                Err(ValueError::RespError(resp)) => Message::SimpleErrors(resp.to_string()),
+                Err(e) => return Err(e.into()),
+            }
+        }
+        ReqCommand::Multi => {
+            // replica may not need transaction
+            if NOT_SLAVE {
+                ctx.transaction.replace(vec![]);
+                RespCommand::Ok.into()
+            } else {
+                return Ok(None);
+            }
+        }
+        cmd => {
+            error!("unsupported command: {:?}", cmd);
+            return Ok(None);
+        }
+    };
+    Ok(Some(message))
+}
+
 async fn process_replica_socket(
-    socket: codec::Framed<TcpStream, MessageFramer>,
-    manager: Arc<ReplicaManager>,
+    socket: &mut codec::Framed<TcpStream, MessageFramer>,
+    manager: &ReplicaManager,
 ) -> anyhow::Result<()> {
     info!("replica connected.");
     let (mut socket_tx, mut socket_rx) = socket.split();
