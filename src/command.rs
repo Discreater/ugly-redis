@@ -53,6 +53,7 @@ pub enum ReqCommand {
     Incr(String),
     Multi,
     Exec,
+    Discard,
 }
 
 #[derive(Debug, Clone)]
@@ -437,6 +438,7 @@ impl ReqCommand {
                 }
                 "MULTI" => Ok(ReqCommand::Multi),
                 "EXEC" => Ok(ReqCommand::Exec),
+                "DISCARD" => Ok(ReqCommand::Discard),
                 _ => Err(ParseMessageError::unsupported(format!("command: {}", data))),
             },
             Err(message) => Err(ParseMessageError::unsupported(format!(
@@ -741,6 +743,9 @@ impl From<ReqCommand> for Message {
             ]),
             ReqCommand::Multi => Message::Arrays(vec![Message::SimpleStrings("Multi".to_string())]),
             ReqCommand::Exec => Message::Arrays(vec![Message::SimpleStrings("Exec".to_string())]),
+            ReqCommand::Discard => {
+                Message::Arrays(vec![Message::SimpleStrings("Discard".to_string())])
+            }
         }
     }
 }

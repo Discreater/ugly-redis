@@ -14,7 +14,6 @@ use redis_starter_rust::{
 use std::{
     collections::HashMap,
     net::{Ipv4Addr, SocketAddrV4},
-    ops::ControlFlow,
     sync::Arc,
     time::{Duration, UNIX_EPOCH},
 };
@@ -209,30 +208,41 @@ async fn process_client_socket<const NOT_SLAVE: bool>(
         let req_command = message.parse_req()?;
         info!("parsed command: {:?}", req_command);
 
-        if matches!(req_command, ReqCommand::Exec) {
-            let Some(transaction) = ctx.transaction.take() else {
-                socket.send(RespError::ExecWithoutMulti.into()).await?;
+        match req_command {
+            ReqCommand::Exec => {
+                let Some(transaction) = ctx.transaction.take() else {
+                    socket.send(RespError::ExecWithoutMulti.into()).await?;
+                    continue;
+                };
+                let mut responds = Vec::with_capacity(transaction.len());
+                for (cmd, bytes) in transaction {
+                    let message = respond_to::<NOT_SLAVE>(
+                        &cmd,
+                        &mut socket,
+                        &db,
+                        &cfg,
+                        &stream_manager,
+                        &replica_manager,
+                        &mut ctx,
+                    )
+                    .await?
+                    .unwrap_or(RespCommand::Nil.into());
+                    ctx.received_bytes += bytes;
+                    responds.push(message);
+                }
+                socket.send(Message::Arrays(responds)).await?;
+                ctx.received_bytes += message_bytes;
                 continue;
-            };
-            let mut responds = Vec::with_capacity(transaction.len());
-            for (cmd, bytes) in transaction {
-                let message = respond_to::<NOT_SLAVE>(
-                    &cmd,
-                    &mut socket,
-                    &db,
-                    &cfg,
-                    &stream_manager,
-                    &replica_manager,
-                    &mut ctx,
-                )
-                .await?
-                .unwrap_or(RespCommand::Nil.into());
-                ctx.received_bytes += bytes;
-                responds.push(message);
             }
-            socket.send(Message::Arrays(responds)).await?;
-            ctx.received_bytes += message_bytes;
-            continue;
+            ReqCommand::Discard => {
+                if ctx.transaction.take().is_none() {
+                    socket.send(RespError::DiscardWithoutMulti.into()).await?;
+                } else {
+                    socket.send(RespCommand::Ok.into()).await?;
+                }
+                continue;
+            }
+            _ => {}
         }
 
         if let Some(transaction) = ctx.transaction.as_mut() {

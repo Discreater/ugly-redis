@@ -17,6 +17,8 @@ pub enum RespError {
     IncrValueNotInteger,
     #[error("ERR EXEC without MULTI")]
     ExecWithoutMulti,
+    #[error("ERR DISCARD without MULTI")]
+    DiscardWithoutMulti,
 }
 
 impl From<RespError> for Message {
