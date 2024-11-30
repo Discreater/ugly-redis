@@ -235,11 +235,13 @@ async fn process_client_socket<const NOT_SLAVE: bool>(
                 continue;
             }
             ReqCommand::Discard => {
-                if ctx.transaction.take().is_none() {
-                    socket.send(RespError::DiscardWithoutMulti.into()).await?;
+                let response = if ctx.transaction.take().is_none() {
+                    RespError::DiscardWithoutMulti.into()
                 } else {
-                    socket.send(RespCommand::Ok.into()).await?;
-                }
+                    RespCommand::Ok.into()
+                };
+                ctx.received_bytes += message_bytes;
+                socket.send(response).await?;
                 continue;
             }
             _ => {}
